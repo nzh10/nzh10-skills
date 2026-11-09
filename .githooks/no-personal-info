@@ -1,6 +1,6 @@
 #!/bin/sh
 # Block commits and pushes that contain personal data other than a GitHub
-# noreply identity. The denylist is local and must not be committed.
+# noreply identity, or credentials. The denylist is local and must not be committed.
 set -eu
 
 denylist=$(git rev-parse --git-path info/no-upload-personal)
@@ -10,8 +10,60 @@ if [ ! -s "$denylist" ]; then
   exit 1
 fi
 
+secret_re() {
+  pem_begin=$(printf '%s%s' '-----BE' 'GIN ')
+  pem_end=$(printf '%s%s' 'PRIVATE KE' 'Y-----')
+  sk=$(printf '%s%s' 's' 'k-')
+  bearer=$(printf '%s%s' 'Bea' 'rer ')
+  printf '%s[A-Z ]*%s|%s[A-Za-z0-9]{20,}|%s[A-Za-z0-9._-]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Z0-9_]*(API_KEY|TOKEN|SECRET)[[:space:]]*=[[:space:]]*[^[:space:]$#]{12,}' \
+    "$pem_begin" "$pem_end" "$sk" "$bearer"
+}
+
+bad_name() {
+  base=${1##*/}
+  case "$base" in
+    auth.json|credentials.json|.env|.env.*|id_rsa|id_ed25519|*.pem|*.p12|*.pfx) return 0 ;;
+  esac
+  return 1
+}
+
+scan_names() {
+  label=$1
+  found=0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    if bad_name "$path"; then
+      echo "refusing: credential filename in $label: $path" >&2
+      found=1
+    fi
+  done
+  return "$found"
+}
+
+scan_secrets() {
+  label=$1
+  shift
+  status=0
+  git grep -I -n -E -e "$(secret_re)" "$@" || status=$?
+  if [ "$status" -eq 0 ]; then
+    echo "refusing: credential pattern in $label" >&2
+    return 1
+  fi
+  if [ "$status" -gt 1 ]; then
+    echo "refusing: credential scan failed in $label" >&2
+    return 1
+  fi
+  return 0
+}
+
 scan_tree() {
   rev=$1
+  if ! git ls-tree -r --name-only "$rev" | scan_names "$rev"; then
+    return 1
+  fi
+  if ! scan_secrets "$rev" "$rev" -- .; then
+    return 1
+  fi
   if git grep -I -n -i -F -f "$denylist" "$rev" -- .; then
     echo "refusing: personal denylist matched $rev" >&2
     return 1
@@ -25,6 +77,12 @@ scan_tree() {
 }
 
 scan_index() {
+  if ! git diff --cached --name-only --diff-filter=ACMR | scan_names index; then
+    return 1
+  fi
+  if ! scan_secrets index --cached -- .; then
+    return 1
+  fi
   if git grep --cached -I -n -i -F -f "$denylist" -- .; then
     echo "refusing: personal denylist matched the index" >&2
     return 1
