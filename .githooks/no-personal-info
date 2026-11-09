@@ -1,0 +1,49 @@
+#!/bin/sh
+# Block commits and pushes that contain personal data other than a GitHub
+# noreply identity. The denylist is local and must not be committed.
+set -eu
+
+denylist=$(git rev-parse --git-path info/no-upload-personal)
+if [ ! -s "$denylist" ]; then
+  echo "refusing: missing $denylist" >&2
+  echo "Add one local pattern per line. Do not commit that file." >&2
+  exit 1
+fi
+
+scan_tree() {
+  rev=$1
+  if git grep -I -n -i -F -f "$denylist" "$rev" -- .; then
+    echo "refusing: personal denylist matched $rev" >&2
+    return 1
+  fi
+  if git grep -I -n -E '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "$rev" -- . \
+    | grep -v '@users\.noreply\.github\.com'; then
+    echo "refusing: non-GitHub email in $rev" >&2
+    return 1
+  fi
+  return 0
+}
+
+scan_index() {
+  if git grep --cached -I -n -i -F -f "$denylist" -- .; then
+    echo "refusing: personal denylist matched the index" >&2
+    return 1
+  fi
+  if git grep --cached -I -n -E '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -- . \
+    | grep -v '@users\.noreply\.github\.com'; then
+    echo "refusing: non-GitHub email in the index" >&2
+    return 1
+  fi
+  return 0
+}
+
+case "${1:-}" in
+  --index) scan_index ;;
+  --rev)
+    scan_tree "$2"
+    ;;
+  *)
+    echo "usage: no-personal-info --index | --rev <sha>" >&2
+    exit 2
+    ;;
+esac

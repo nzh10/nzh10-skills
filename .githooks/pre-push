@@ -1,0 +1,11 @@
+#!/bin/sh
+# stdin: <local ref> <local sha> <remote ref> <remote sha>
+set -eu
+root=$(git rev-parse --show-toplevel)
+zero=0000000000000000000000000000000000000000
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  if [ "$local_sha" = "$zero" ]; then
+    continue
+  fi
+  "$root/.githooks/no-personal-info" --rev "$local_sha"
+done
