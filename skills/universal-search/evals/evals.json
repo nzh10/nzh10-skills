@@ -1,0 +1,136 @@
+{
+  "skill_name": "universal-search",
+  "rubric_version": 2,
+  "evals": [
+    {
+      "id": 1,
+      "eval_name": "llms-txt-static-file",
+      "prompt": "我们组下周要定检索供应商。帮我从 https://qovia.ai/llms.txt 里核一下抖音搜索：一次多少钱、翻页要带什么、必填参数是什么。查完给我结论，附上你查的文件路径。",
+      "expected_output": "curl 下载 llms.txt；答出 $0.0005、keyword、cursor/search_id；给出本地文件路径。",
+      "rubric": [
+        {
+          "id": "tool",
+          "text": "用 curl/bash 下载静态文件，没有成功的付费 web_fetch",
+          "points": 30
+        },
+        {
+          "id": "price",
+          "text": "答出抖音搜索 $0.0005/次",
+          "points": 20
+        },
+        {
+          "id": "params",
+          "text": "答出必填 keyword 与翻页 cursor/search_id",
+          "points": 20
+        },
+        {
+          "id": "evidence",
+          "text": "给出查证的文件路径（如 /tmp/qovia-llms.txt）",
+          "points": 20
+        },
+        {
+          "id": "concise",
+          "text": "两行内说完，不铺开无关端点",
+          "points": 10
+        }
+      ],
+      "max_score": 100,
+      "pass_score": 80
+    },
+    {
+      "id": 2,
+      "eval_name": "github-repo-reading",
+      "prompt": "我在评估 https://github.com/meetingup/cimi-gzh-collect 这个仓库：它搜公众号和公众号文章，是自己抓微信页面，还是调商业接口？给我关键文件、调用链和一次调用的参考价。",
+      "expected_output": "git clone 或 gh api 读仓库；指出 SKILL.md、references/endpoints.md、scripts/cimidata_client.py；接口 /api/v3/accounts/search，参考价 0.10 元。",
+      "rubric": [
+        {
+          "id": "tool",
+          "text": "用 git clone 或 gh api 读仓库，没有成功的付费 web_fetch",
+          "points": 40
+        },
+        {
+          "id": "endpoint",
+          "text": "指出搜号接口 /api/v3/accounts/search",
+          "points": 20
+        },
+        {
+          "id": "files",
+          "text": "给出 SKILL.md、endpoints.md、cimidata_client.py 三处关键文件",
+          "points": 20
+        },
+        {
+          "id": "chain",
+          "text": "说清 search_accounts → request 的调用链",
+          "points": 20
+        }
+      ],
+      "max_score": 100,
+      "pass_score": 80
+    },
+    {
+      "id": 3,
+      "eval_name": "wechat-measured-review",
+      "prompt": "我在写一篇关于国行 Apple Watch Ultra 4 充电的稿子，需要国内作者的实测，不要官方参数。找两三篇有具体计时或功率的，给我链接、测试条件和结论。",
+      "expected_output": "1 次微信搜索 + ≤3 次抓取；≥2 个文章链接；写明测试条件；指出同源或转载；不跨平台搜小红书/抖音。",
+      "rubric": [
+        {
+          "id": "budget",
+          "text": "付费调用 ≤6 次（一次搜索加三次抓取）",
+          "points": 30
+        },
+        {
+          "id": "links",
+          "text": "给出至少 2 个文章链接",
+          "points": 25
+        },
+        {
+          "id": "conditions",
+          "text": "写明测试条件（恒温、关优化充电、功率档位等）",
+          "points": 20
+        },
+        {
+          "id": "same_source",
+          "text": "指出同源/转载，不把转载当第二次独立测试",
+          "points": 15
+        },
+        {
+          "id": "platform",
+          "text": "不跨平台搜小红书或抖音",
+          "points": 10
+        }
+      ],
+      "max_score": 100,
+      "pass_score": 80
+    },
+    {
+      "id": 4,
+      "eval_name": "xiaohongshu-notes",
+      "prompt": "帮我看小红书上 Apple Watch Ultra 4 的充电体验，重点是国行有没有快充、实测充满要多久。找三篇有正文的，给我链接和要点。",
+      "expected_output": "social_search platform=xiaohongshu；≤6 次付费调用；≥2 条笔记链接；给出计时/功率等具体数据，并标注只有图无数据的笔记。",
+      "rubric": [
+        {
+          "id": "tool",
+          "text": "用 social_search 搜小红书",
+          "points": 30
+        },
+        {
+          "id": "budget",
+          "text": "付费调用 ≤6 次",
+          "points": 25
+        },
+        {
+          "id": "links",
+          "text": "给出至少 2 条小红书笔记链接",
+          "points": 25
+        },
+        {
+          "id": "data",
+          "text": "给出充满时长/功率等具体数据，并标注无数据笔记",
+          "points": 20
+        }
+      ],
+      "max_score": 100,
+      "pass_score": 80
+    }
+  ]
+}
