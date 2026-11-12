@@ -1,0 +1,7 @@
+{
+  "machineId": "zd-wsl",
+  "incubatingPackages": [],
+  "notes": [
+    "Primary Linux development hub; local independent packages (reply-review, session-work-report) are mounted only in local settings.json."
+  ]
+}

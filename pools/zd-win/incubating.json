@@ -1,0 +1,7 @@
+{
+  "machineId": "zd-win",
+  "incubatingPackages": [],
+  "notes": [
+    "Read-only sync node; receives canon configuration, extensions, and skills from nzh10-skills."
+  ]
+}

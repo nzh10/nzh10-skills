@@ -1,0 +1,40 @@
+{
+  "skill_name": "pi-steward",
+  "evals": [
+    {
+      "id": 1,
+      "eval_name": "save-pool-dirty-index-and-local-path",
+      "prompt": "帮我把这台机器目前正在试用的 Pi 插件存进沉淀池。",
+      "expected_output": "读取 machine.json、settings.json 与 canon/settings.canon.json，区分可跨机插件（npm:pi-mcp-adapter、git:github.com/example/pi-fast-grep）与必须排除的本机路径插件（~/src/personal/my-local-ext）；执行 steward-preflight.sh 发现暂存区已有无关文件 extensions/plain-check.ts 后立即中止写入与提交，向用户报告拦截原因并附上盘点出的待存清单与排除项。",
+      "files": [],
+      "expectations": [
+        "调用内置脚本 steward-preflight.sh 执行写仓前置检查",
+        "检测到暂存区已有无关文件 extensions/plain-check.ts 后立即中止，未修改 pools/dev-wsl/incubating.json 且未产生新 git commit",
+        "简明列出可跨机保存的 npm:pi-mcp-adapter、git:github.com/example/pi-fast-grep 与排除的本机路径 ~/src/personal/my-local-ext，不含“门禁”等黑话或无差异项赘述"
+      ]
+    },
+    {
+      "id": 2,
+      "eval_name": "promote-and-demote-canon",
+      "prompt": "pi-mcp-adapter 我试用下来挺稳的，帮我转正到全局配置；另外把全局 enabledModels 里的 deepseek/deepseek-flash 删掉。",
+      "expected_output": "先跑通 steward-preflight.sh；补全 npm:pi-mcp-adapter 写入 canon/settings.canon.json 的 packages 并从 pools/dev-wsl/incubating.json 移除；从 canon/settings.canon.json、本机 settings.json 与 .pi-steward-state.json 移除 deepseek/deepseek-flash；精确 git add、commit、push 并同步本机 git 包缓存，提示 /reload（不主动堆砌具体 commit id）。",
+      "files": [],
+      "expectations": [
+        "写仓前运行 steward-preflight.sh 且未使用 --no-verify",
+        "canon/settings.canon.json 已加入 npm:pi-mcp-adapter（带 npm: 前缀）且移除了 deepseek/deepseek-flash，同时 pools/dev-wsl/incubating.json 已移除 npm:pi-mcp-adapter",
+        "本机 settings.json 与 .pi-steward-state.json 同步移除了 deepseek/deepseek-flash，变更已推送至远端并同步包缓存，提示 /reload 且不堆砌无关 commit hash"
+      ]
+    },
+    {
+      "id": 3,
+      "eval_name": "readonly-node-and-coldstart-bootstrap",
+      "prompt": "这是一台刚同步过来的新 Linux 机器（没 sudo 权限），我想把 pi-btw 从全局配置里卸掉；另外帮我检查一下这台机器冷启动缺不缺 uv、python3、ntn 这些命令行工具，缺的话怎么装。",
+      "expected_output": "识别 machine.json 缺少 hubRepoPath（只读同步节点），保持包缓存 git/github.com/nzh10/nzh10-skills 干净未改，直接引导在可写主力机操作或克隆后运行 /hub-init（不堆砌“不能…也不能…”句式）；同时调用 scripts/bootstrap-cli.sh --check 并明确给出缺失时的 --install 命令。",
+      "files": [],
+      "expectations": [
+        "识别当前机器为只读同步节点（machine.json 无 hubRepoPath），包缓存 git 状态保持干净，直接引导主力机或 /hub-init 且不含“不能…也不能…”说教句式",
+        "运行内置 scripts/bootstrap-cli.sh --check 检查并在回复中明确附上缺失时的 bootstrap-cli.sh --install 安装方式"
+      ]
+    }
+  ]
+}

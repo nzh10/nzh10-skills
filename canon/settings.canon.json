@@ -1,0 +1,20 @@
+{
+  "defaultProvider": "xai",
+  "defaultModel": "grok-4.7",
+  "enabledModels": [
+    "xai/grok-4.7",
+    "kimi-coding/k3.1-pro-highspeed",
+    "antigravity-acp/gemini-4-carbon",
+    "antigravity-acp/gemini-3.8-flash",
+    "deepseek/deepseek-flash",
+    "kimi-coding/k3.1-pro",
+    "antigravity-acp/gemini-4-argon"
+  ],
+  "packages": [
+    "git:github.com/nzh10/nzh10-skills",
+    "npm:pi-antigravity-acp-provider",
+    "npm:pi-subagents",
+    "npm:pi-intercom",
+    "npm:pi-btw"
+  ]
+}
