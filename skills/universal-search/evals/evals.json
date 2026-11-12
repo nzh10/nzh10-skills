@@ -1,12 +1,12 @@
 {
   "skill_name": "universal-search",
-  "rubric_version": 2,
+  "rubric_version": 3,
   "evals": [
     {
       "id": 1,
       "eval_name": "llms-txt-static-file",
       "prompt": "我们组下周要定检索供应商。帮我从 https://qovia.ai/llms.txt 里核一下抖音搜索：一次多少钱、翻页要带什么、必填参数是什么。查完给我结论，附上你查的文件路径。",
-      "expected_output": "curl 下载 llms.txt；答出 $0.0005、keyword、cursor/search_id；给出本地文件路径。",
+      "expected_output": "用 curl 下载 llms.txt；首句直接答出 GET /v1/raw/douyin/search 一次 $0.0005、必填 keyword、翻页带 cursor 与 search_id，附上本地文件路径（如 /tmp/qovia-llms.txt）；精炼直给，不铺开多行无关端点表，也不画蛇添足写“各子页面这次没打开”。",
       "rubric": [
         {
           "id": "tool",
@@ -14,24 +14,19 @@
           "points": 30
         },
         {
-          "id": "price",
-          "text": "答出抖音搜索 $0.0005/次",
-          "points": 20
-        },
-        {
-          "id": "params",
-          "text": "答出必填 keyword 与翻页 cursor/search_id",
-          "points": 20
+          "id": "price_and_params",
+          "text": "准确答出抖音搜索 $0.0005/次、必填 keyword、翻页带 cursor 与 search_id",
+          "points": 35
         },
         {
           "id": "evidence",
-          "text": "给出查证的文件路径（如 /tmp/qovia-llms.txt）",
+          "text": "给出查证的本地文件路径（如 /tmp/qovia-llms.txt）",
           "points": 20
         },
         {
-          "id": "concise",
-          "text": "两行内说完，不铺开无关端点",
-          "points": 10
+          "id": "concise_no_slop",
+          "text": "精炼直给（不铺开无关大表，不含“各子详情页没打开”等无关免责话术）",
+          "points": 15
         }
       ],
       "max_score": 100,
@@ -41,27 +36,27 @@
       "id": 2,
       "eval_name": "github-repo-reading",
       "prompt": "我在评估 https://github.com/meetingup/cimi-gzh-collect 这个仓库：它搜公众号和公众号文章，是自己抓微信页面，还是调商业接口？给我关键文件、调用链和一次调用的参考价。",
-      "expected_output": "git clone 或 gh api 读仓库；指出 SKILL.md、references/endpoints.md、scripts/cimidata_client.py；接口 /api/v3/accounts/search，参考价 0.10 元。",
+      "expected_output": "用 git clone 或 gh api 读仓库；首句直接说明调次幂数据商业接口 api.cimidata.com；指出 SKILL.md、references/endpoints.md、scripts/cimidata_client.py；说明 search_accounts/search_articles → request → _http 调用链及参考价（搜号 0.10 元、搜一搜 0.05 元、库内 0.02 元），不含“是参考价不是实价”等套话。",
       "rubric": [
         {
           "id": "tool",
           "text": "用 git clone 或 gh api 读仓库，没有成功的付费 web_fetch",
-          "points": 40
+          "points": 35
         },
         {
-          "id": "endpoint",
-          "text": "指出搜号接口 /api/v3/accounts/search",
-          "points": 20
+          "id": "endpoint_and_price",
+          "text": "指出搜号接口 /api/v3/accounts/search（0.10 元）与搜文接口（0.05 元 / 0.02 元）",
+          "points": 25
         },
         {
-          "id": "files",
-          "text": "给出 SKILL.md、endpoints.md、cimidata_client.py 三处关键文件",
-          "points": 20
+          "id": "files_and_chain",
+          "text": "给出 SKILL.md、endpoints.md、cimidata_client.py 关键文件与 search_accounts → request 调用链",
+          "points": 25
         },
         {
-          "id": "chain",
-          "text": "说清 search_accounts → request 的调用链",
-          "points": 20
+          "id": "clean_style",
+          "text": "未出现“是…不是…”黑话句式或“未用真凭据实测扣费”等无关免责声明",
+          "points": 15
         }
       ],
       "max_score": 100,
@@ -71,32 +66,27 @@
       "id": 3,
       "eval_name": "wechat-measured-review",
       "prompt": "我在写一篇关于国行 Apple Watch Ultra 4 充电的稿子，需要国内作者的实测，不要官方参数。找两三篇有具体计时或功率的，给我链接、测试条件和结论。",
-      "expected_output": "1 次微信搜索 + ≤3 次抓取；≥2 个文章链接；写明测试条件；指出同源或转载；不跨平台搜小红书/抖音。",
+      "expected_output": "首句直接给出国行 Ultra 4 充电的实质实测结论（无快充、功率约 2.7–3.08W、充满约 2 小时 16 分）；总付费调用 ≤6 次且不超时、不跨去抓 B 站/小红书/抖音；给出有效文章链接、测试条件，并识别同源转载。",
       "rubric": [
         {
-          "id": "budget",
-          "text": "付费调用 ≤6 次（一次搜索加三次抓取）",
-          "points": 30
-        },
-        {
-          "id": "links",
-          "text": "给出至少 2 个文章链接",
-          "points": 25
-        },
-        {
-          "id": "conditions",
-          "text": "写明测试条件（恒温、关优化充电、功率档位等）",
+          "id": "opening_conclusion",
+          "text": "首句直接给出国行 Ultra 4 充电的实质实测结论（具体功率或充满时长），而非先盘点哪篇文章能用",
           "points": 20
         },
         {
-          "id": "same_source",
-          "text": "指出同源/转载，不把转载当第二次独立测试",
-          "points": 15
+          "id": "budget_no_timeout",
+          "text": "按时完成无超时，且付费调用 ≤6 次",
+          "points": 25
         },
         {
-          "id": "platform",
-          "text": "不跨平台搜小红书或抖音",
-          "points": 10
+          "id": "links_and_conditions",
+          "text": "给出至少 2 个有效文章链接，并写明对应测试条件（恒温、充电器、熄屏/亮屏等）",
+          "points": 30
+        },
+        {
+          "id": "same_source_and_platform",
+          "text": "识别同源/转载，且未跨平台调 social_search / social_fetch 抓小红书、抖音或 B 站",
+          "points": 25
         }
       ],
       "max_score": 100,
@@ -106,27 +96,52 @@
       "id": 4,
       "eval_name": "xiaohongshu-notes",
       "prompt": "帮我看小红书上 Apple Watch Ultra 4 的充电体验，重点是国行有没有快充、实测充满要多久。找三篇有正文的，给我链接和要点。",
-      "expected_output": "social_search platform=xiaohongshu；≤6 次付费调用；≥2 条笔记链接；给出计时/功率等具体数据，并标注只有图无数据的笔记。",
+      "expected_output": "用 social_search 搜小红书，付费调用 ≤6 次；首句直接给出国行无快充及实测充电时长结论（开头不塞“评论区没读”等无关过程话术）；所列笔记均包含具体充电体验或时长/功率数据，不塞无关废稿凑数。",
       "rubric": [
         {
-          "id": "tool",
-          "text": "用 social_search 搜小红书",
+          "id": "tool_and_budget",
+          "text": "用 social_search 搜小红书，且总付费调用 ≤6 次",
+          "points": 35
+        },
+        {
+          "id": "relevant_links_and_data",
+          "text": "给出至少 2 条含具体充电时长/功率数据的小红书笔记链接，未混入毫无充电表现的废稿充数",
+          "points": 40
+        },
+        {
+          "id": "opening_focus",
+          "text": "首段直接聚焦国行快充与充满时间结论，未在开头塞入“评论区没读”等无关说明",
+          "points": 25
+        }
+      ],
+      "max_score": 100,
+      "pass_score": 80
+    },
+    {
+      "id": 5,
+      "eval_name": "vendor-pricing-combo",
+      "prompt": "我们组给内部脚本做检索接口选型，供应商尽量少，但两项优先级都要覆盖：1）微信公众号文章搜索；2）抖音与小红书搜索。范围只看这四家：A. 次幂数据（https://github.com/meetingup/cimi-gzh-collect ，商务已给到我们内部协议价 ¥0.04/次）；B. Qovia（https://qovia.ai/llms.txt ）；C. 飞瓜数据（https://dy.feigua.cn/Member/Price ）；D. 新榜网页版榜单后台（仅人工浏览器导出 Excel，无 API，¥9800/年）。帮我做比价并直接定最终方案。",
+      "expected_output": "首句直接给出保住两项优先级的最少供应商方案（近 90 天内单选 Qovia 一家；需超 90 天公众号历史则用「次幂数据 + Qovia」两家组合）及准确单价；排除无 API 的新榜网页版；直接采用用户给定的次幂 ¥0.04/次协议价并用免费工具核实其仅覆盖公众号；发现飞瓜 Member/Price 返回 0 字节后主动顺着 dy.feigua.cn 同站定位现行官方页（如 Home/Price 与帮助页）核实其为抖音网页版会员（¥399/月起、无按次开放检索 API 且与小红书不通用），而非写“不能确认”敷衍跳过。",
+      "rubric": [
+        {
+          "id": "combo_conclusion_first",
+          "text": "首句直接定出最少供应商方案并给出 Qovia 三项准确单价（公众号 POST /v1/search $0.005/次、抖音 $0.0005/次、小红书 $0.005/页，且点明 90 天限制或超 90 天补次幂 ¥0.04/次）",
           "points": 30
         },
         {
-          "id": "budget",
-          "text": "付费调用 ≤6 次",
-          "points": 25
+          "id": "feigua_followup_verified",
+          "text": "发现飞瓜 Member/Price 为空壳后未止步于“不能确认”，而是从 dy.feigua.cn 同站（如 Home/Price 或帮助页）核实出飞瓜为网页会员制（如 ¥399/月起）且无开放检索接口，同时如实区分 Member/Price 为空与实价来源",
+          "points": 35
         },
         {
-          "id": "links",
-          "text": "给出至少 2 条小红书笔记链接",
-          "points": 25
-        },
-        {
-          "id": "data",
-          "text": "给出充满时长/功率等具体数据，并标注无数据笔记",
+          "id": "user_price_and_free_fetch",
+          "text": "直接采用用户提供的次幂 ¥0.04/次协议价，并用免费 curl/git/gh 读取 qovia.ai/llms.txt 与 cimi 仓库（未对静态 llms.txt 产生成功的付费 web_fetch）",
           "points": 20
+        },
+        {
+          "id": "callable_api_scope",
+          "text": "明确排除无 API 的新榜网页版",
+          "points": 15
         }
       ],
       "max_score": 100,
