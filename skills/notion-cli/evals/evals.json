@@ -1,0 +1,41 @@
+{
+  "skill_name": "notion-cli",
+  "evals": [
+    {
+      "id": 1,
+      "eval_name": "live-url-page-create-edit-and-comment",
+      "prompt": "我在我们 Notion 测试页 <NOTION_TEST_PAGE_URL> 下做发布演练：请先读取这页当前内容，在它下面新建一个子页面（内容来自 /tmp/notion-eval-inputs/release-notes.md），再把新建子页的正文末尾追加一行 `Verified by ntn`，最后往这个新建子页留一条评论：`自动化验收通过，详见 **[看板](https://example.com/board)**`，把新建子页的 ID 和读取验证结果发我。",
+      "expected_output": "先将 ~/.local/bin 加入 PATH，直接测试 ntn whoami（不盲设 NOTION_KEYRING=0 遮蔽系统钥匙串凭据）；从 Notion URL 提取 32 位十六进制页面 ID 调用 ntn pages get（不把完整 URL 直接传给 ntn pages 触发 400）；用 ntn pages create --parent page:<id> < release-notes.md 创建子页、ntn pages edit <child-id> 非交互更新全文，并用 ntn api v1/comments 原生 markdown 字段发表带粗体链接的评论，最后读回验证。",
+      "files": [],
+      "expectations": [
+        "确保 ~/.local/bin 在 PATH 中并先用普通 ntn whoami 验证登录态（未盲目设置 NOTION_KEYRING=0 破坏钥匙串读取），且先从 Notion URL 提取 32 位/UUID 页面 ID 再调用 ntn pages",
+        "通过非交互方式（< 重定向或 --content）成功执行 ntn pages create 与 ntn pages edit（未使用不存在的 ntn pages update），新建子页读回正文包含追加的 Verified by ntn",
+        "使用 ntn api v1/comments 的原生 markdown 字段成功在新建子页发表含粗体链接的评论并返回验证结果"
+      ]
+    },
+    {
+      "id": 2,
+      "eval_name": "live-database-resolve-query-and-patch",
+      "prompt": "在测试页下的演练数据库 <NOTION_TEST_DB_ID> 里（有可能包含多数据源），帮我解析它的底层 data source ID，查出 Checkbox 属性 Reviewed 为 true 的前 20 条记录（JSON），再把其中标题含 `Alpha` 那条记录的 Status 属性改成 `Done` 并读回确认。",
+      "expected_output": "先用 ntn datasources resolve <db-id> --json 解析底层 data source ID，再用 ntn datasources query <ds-id> --limit 20 --filter '{\"property\":\"Reviewed\",\"checkbox\":{\"equals\":true}}' --json 查询；定位 Alpha 记录后用 ntn api -X PATCH v1/pages/<row-id> 更新 Status 属性并读回确认。",
+      "files": [],
+      "expectations": [
+        "实际执行 ntn datasources resolve <db-id> --json 获取底层 data source ID",
+        "实际执行 ntn datasources query <ds-id> --limit 20 --filter '{\"property\":\"Reviewed\",\"checkbox\":{\"equals\":true}}' --json 查出匹配行",
+        "实际执行 ntn api -X PATCH v1/pages/<row-id> 将 Alpha 记录的 Status 改为 Done 并核实成功"
+      ]
+    },
+    {
+      "id": 3,
+      "eval_name": "live-file-upload-worker-check-and-bootstrap",
+      "prompt": "帮我把本地图片 /tmp/notion-eval-inputs/arch-diagram.png 真正上传到当前 Notion 工作区的文件接口并读回上传状态（状态为 uploaded），再实测检查当前账号的 Notion Workers 可用性与权限；最后附一段给无 sudo 权限的新 Linux 机器安装 ntn 到 ~/.local/bin 的初始化片段。",
+      "expected_output": "用标准输入重定向 ntn files create --filename arch-diagram.png --content-type image/png < /tmp/notion-eval-inputs/arch-diagram.png 实际上传文件并用 ntn files get <id> 核实 uploaded 状态；运行 ntn workers availability 实测返回当前工作区权限；给出的免 sudo 安装片段将 NTN_INSTALL_DIR=\"$HOME/.local/bin\" 放在管道右侧 bash 前。",
+      "files": [],
+      "expectations": [
+        "使用标准输入重定向 ntn files create 实际完成 PNG 上传，并用 ntn files get <upload-id> 验证状态为 uploaded",
+        "实际调用 ntn workers availability 返回当前工作区真实 Workers 权限状态",
+        "免 sudo 安装命令正确写成 curl -fsSL https://ntn.dev | NTN_INSTALL_DIR=\"$HOME/.local/bin\" bash（环境变量作用于管道右侧 bash 而非左侧 curl）"
+      ]
+    }
+  ]
+}
