@@ -15,14 +15,14 @@ secret_re() {
   pem_end=$(printf '%s%s' 'PRIVATE KE' 'Y-----')
   sk=$(printf '%s%s' 's' 'k-')
   bearer=$(printf '%s%s' 'Bea' 'rer ')
-  printf '%s[A-Z ]*%s|%s[A-Za-z0-9]{20,}|%s[A-Za-z0-9._-]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|[A-Z0-9_]*(API_KEY|TOKEN|SECRET)[[:space:]]*=[[:space:]]*[^[:space:]$#]{12,}' \
+  printf '%s[A-Z ]*%s|%s[A-Za-z0-9]{20,}|%s[A-Za-z0-9._-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|[A-Za-z0-9_]*(API_KEY|TOKEN|SECRET)[[:space:]]*=[[:space:]]*[^[:space:]$#]{12,}|"(apiKey|api_key|access_token|secret|token)"[[:space:]]*:[[:space:]]*"[^"[:space:]]{16,}"' \
     "$pem_begin" "$pem_end" "$sk" "$bearer"
 }
 
 bad_name() {
   base=${1##*/}
   case "$base" in
-    auth.json|credentials.json|.env|.env.*|id_rsa|id_ed25519|*.pem|*.p12|*.pfx) return 0 ;;
+    auth.json|credentials.json|machine.json|.pi-steward-state.json|APPEND_SYSTEM.md|.env|.env.*|id_rsa|id_ed25519|*.pem|*.p12|*.pfx) return 0 ;;
   esac
   return 1
 }

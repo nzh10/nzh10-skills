@@ -1,11 +1,23 @@
 #!/bin/sh
+# args: <remote-name> <remote-url>
 # stdin: <local ref> <local sha> <remote ref> <remote sha>
 set -eu
+remote_name=${1:-origin}
 root=$(git rev-parse --show-toplevel)
 zero=0000000000000000000000000000000000000000
-while read -r _local_ref local_sha _remote_ref _remote_sha; do
+while read -r _local_ref local_sha _remote_ref remote_sha; do
   if [ "$local_sha" = "$zero" ]; then
     continue
   fi
-  "$root/.githooks/no-personal-info" --rev "$local_sha"
+  if [ "$remote_sha" = "$zero" ]; then
+    revs=$(git rev-list "$local_sha" --not --remotes="$remote_name")
+  else
+    revs=$(git rev-list "${remote_sha}..${local_sha}")
+  fi
+  if [ -z "$revs" ]; then
+    revs="$local_sha"
+  fi
+  for rev in $revs; do
+    "$root/.githooks/no-personal-info" --rev "$rev"
+  done
 done
