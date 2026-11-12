@@ -18,6 +18,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -247,6 +248,46 @@ def load_previous_iteration(workspace: Path) -> dict[str, dict]:
     return result
 
 
+def _safe_script_json(obj: object) -> str:
+    """Serialize JSON safely for inline HTML <script> embedding."""
+    return (
+        json.dumps(obj)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _validate_generated_html(html_text: str) -> None:
+    """Fail fast if inline <script> blocks were truncated or contain invalid JS."""
+    if "/*__EMBEDDED_DATA__*/" in html_text:
+        raise RuntimeError("viewer template placeholder /*__EMBEDDED_DATA__*/ was not replaced")
+    inline_scripts = re.findall(r"<script>([\s\S]*?)</script>", html_text, flags=re.IGNORECASE)
+    if len(inline_scripts) != 1:
+        raise RuntimeError(
+            f"expected 1 inline <script> block in generated HTML, found {len(inline_scripts)}"
+        )
+    node_bin = shutil.which("node")
+    if node_bin:
+        check = subprocess.run(
+            [
+                node_bin,
+                "-e",
+                "const fs=require('fs'),vm=require('vm');new vm.Script(fs.readFileSync(0,'utf8'));",
+            ],
+            input=inline_scripts[0],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if check.returncode != 0:
+            raise RuntimeError(
+                f"generated review HTML failed JS syntax check:\n{check.stderr.strip()}"
+            )
+
+
 def generate_html(
     runs: list[dict],
     skill_name: str,
@@ -276,9 +317,10 @@ def generate_html(
     if benchmark:
         embedded["benchmark"] = benchmark
 
-    data_json = json.dumps(embedded)
-
-    return template.replace("/*__EMBEDDED_DATA__*/", f"const EMBEDDED_DATA = {data_json};")
+    data_json = _safe_script_json(embedded)
+    html_text = template.replace("/*__EMBEDDED_DATA__*/", f"const EMBEDDED_DATA = {data_json};")
+    _validate_generated_html(html_text)
+    return html_text
 
 
 # ---------------------------------------------------------------------------

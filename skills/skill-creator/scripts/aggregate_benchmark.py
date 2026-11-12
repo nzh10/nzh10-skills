@@ -97,8 +97,11 @@ def load_run_results(benchmark_dir: Path) -> dict:
             except ValueError:
                 eval_id = eval_idx
 
-        # Discover config directories dynamically rather than hardcoding names
-        for config_dir in sorted(eval_dir.iterdir()):
+        # Discover config directories dynamically, placing primary configs (with_skill/new_skill) before baselines (without_skill/old_skill)
+        def _config_sort_key(p: Path) -> tuple[int, str]:
+            return (0 if p.name in ("with_skill", "new_skill") else 1, p.name)
+
+        for config_dir in sorted(eval_dir.iterdir(), key=_config_sort_key):
             if not config_dir.is_dir():
                 continue
             # Skip non-config directories (inputs, outputs, etc.)
@@ -136,13 +139,16 @@ def load_run_results(benchmark_dir: Path) -> dict:
                 # Extract timing — check grading.json first, then sibling timing.json
                 timing = grading.get("timing", {})
                 result["time_seconds"] = timing.get("total_duration_seconds", 0.0)
+                result["tokens"] = timing.get("total_tokens", 0)
                 timing_file = run_dir / "timing.json"
-                if result["time_seconds"] == 0.0 and timing_file.exists():
+                if (result["time_seconds"] == 0.0 or not result["tokens"]) and timing_file.exists():
                     try:
                         with open(timing_file) as tf:
                             timing_data = json.load(tf)
-                        result["time_seconds"] = timing_data.get("total_duration_seconds", 0.0)
-                        result["tokens"] = timing_data.get("total_tokens", 0)
+                        if result["time_seconds"] == 0.0:
+                            result["time_seconds"] = timing_data.get("total_duration_seconds", 0.0)
+                        if not result["tokens"]:
+                            result["tokens"] = timing_data.get("total_tokens", 0)
                     except json.JSONDecodeError:
                         pass
 
