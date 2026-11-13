@@ -7,18 +7,27 @@ queries. Outputs results as JSON.
 
 import argparse
 import json
-import os
-import select
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from scripts.utils import parse_skill_md
+
+
+def find_project_root() -> Path:
+    """Find the project root by walking up from cwd looking for .pi/ or .git/."""
+    current = Path.cwd()
+    for parent in [current, *current.parents]:
+        if (parent / ".pi").is_dir() or (parent / ".git").exists():
+            return parent
+    return current
 
 
 def _pi_read_triggered(event: dict, marker: str) -> bool:
@@ -71,6 +80,8 @@ def run_single_query(
 
         cmd = [
             "pi",
+            "--no-extensions",
+            "--offline",
             "--skill", str(skill_dir),
             "--no-skills",
             "--no-session",
@@ -88,47 +99,52 @@ def run_single_query(
             cwd=skill_dir,
         )
         assert process.stdin is not None
-        process.stdin.write(query.encode())
+        assert process.stdout is not None
+        process.stdin.write(query.encode("utf-8"))
         process.stdin.close()
 
-        triggered = False
-        start_time = time.time()
-        buffer = ""
+        line_queue: queue.Queue[bytes | None] = queue.Queue()
 
+        def _pump_stdout(pipe) -> None:
+            try:
+                for raw_line in iter(pipe.readline, b""):
+                    line_queue.put(raw_line)
+            finally:
+                line_queue.put(None)
+
+        reader = threading.Thread(target=_pump_stdout, args=(process.stdout,), daemon=True)
+        reader.start()
+
+        deadline = time.monotonic() + timeout
         try:
-            while time.time() - start_time < timeout:
-                if process.poll() is not None:
-                    remaining = process.stdout.read()
-                    if remaining:
-                        buffer += remaining.decode("utf-8", errors="replace")
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
-
-                ready, _, _ = select.select([process.stdout], [], [], 1.0)
-                if not ready:
+                try:
+                    raw_line = line_queue.get(timeout=min(1.0, remaining))
+                except queue.Empty:
+                    if process.poll() is not None and not reader.is_alive() and line_queue.empty():
+                        break
                     continue
-
-                chunk = os.read(process.stdout.fileno(), 8192)
-                if not chunk:
+                if raw_line is None:
                     break
-                buffer += chunk.decode("utf-8", errors="replace")
-
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if _pi_read_triggered(event, clean_name):
-                        return True
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if _pi_read_triggered(event, clean_name):
+                    return True
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
+            reader.join(timeout=1.0)
 
-        return triggered
+        return False
     finally:
         shutil.rmtree(skill_dir, ignore_errors=True)
 

@@ -20,11 +20,6 @@ git -C "$tmp/src" sparse-checkout set "$upstream_path"
 sha=$(git -C "$tmp/src" rev-parse HEAD)
 test -f "$tmp/src/$upstream_path/SKILL.md"
 
-if [ -f "$meta" ] && grep -F -q "\"sha\": \"$sha\"" "$meta"; then
-  echo "skill-creator already at $sha"
-  exit 0
-fi
-
 mkdir -p "$tmp/tree/skills"
 cp -a "$tmp/src/$upstream_path" "$tmp/tree/skills/skill-creator"
 if [ -f "$patch" ]; then

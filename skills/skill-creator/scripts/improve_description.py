@@ -22,7 +22,7 @@ def _call_pi(prompt: str, model: str | None, timeout: int = 300) -> str:
     body and can easily exceed comfortable argv length. Tools and other
     skills are disabled so this stays a single description rewrite.
     """
-    cmd = ["pi", "--no-session", "--no-skills", "--no-tools", "-p"]
+    cmd = ["pi", "--no-extensions", "--offline", "--no-session", "--no-skills", "--no-tools", "-p"]
     if model:
         cmd.extend(["--model", model])
 
