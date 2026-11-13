@@ -12,17 +12,23 @@ export type CompiledRegex = {
 export type Config = {
 	enabled: boolean;
 	max_retries: number;
+	negation_max_retries?: number;
 	regex_min_sentences: number;
+	negation_sentence_ratio?: number;
+	negation_max_per_sentence?: number;
 	keywords: string[];
 	regex: string[];
 	tail_regex?: string[];
+	negation_regex?: string[];
+	negation_allow?: string[];
 };
 
 export type Hit = {
-	kind: "keyword" | "regex" | "tail_regex";
+	kind: "keyword" | "regex" | "tail_regex" | "negation";
 	rule: string;
 	match: string;
 	count: number;
+	budget?: number;
 };
 
 const MODULE_DIR =
@@ -38,10 +44,15 @@ const REWRITE_TYPE = "plain-check-rewrite";
 const DEFAULT_CONFIG: Config = {
 	enabled: false,
 	max_retries: 3,
+	negation_max_retries: 1,
 	regex_min_sentences: 2,
+	negation_sentence_ratio: 3,
+	negation_max_per_sentence: 2,
 	keywords: [],
 	regex: [],
 	tail_regex: [],
+	negation_regex: [],
+	negation_allow: [],
 };
 
 function unescapeTomlBasicString(body: string): string {
@@ -232,27 +243,37 @@ export function loadConfig(explicitPath?: string): { config: Config; configPath:
 	}
 	const raw = fs.readFileSync(configPath, "utf8");
 	const data = parsePlainCheckToml(raw);
-	const keywords = Array.isArray(data.keywords)
-		? data.keywords.filter((value: unknown): value is string => typeof value === "string" && value.length > 0)
-		: [];
-	const regex = Array.isArray(data.regex)
-		? data.regex.filter((value: unknown): value is string => typeof value === "string" && value.length > 0)
-		: [];
-	const tailRegex = Array.isArray(data.tail_regex)
-		? data.tail_regex.filter((value: unknown): value is string => typeof value === "string" && value.length > 0)
-		: [];
+	const asStringList = (val: unknown): string[] =>
+		Array.isArray(val)
+			? val.filter((value: unknown): value is string => typeof value === "string" && value.length > 0)
+			: [];
+	const keywords = asStringList(data.keywords);
+	const regex = asStringList(data.regex);
+	const tailRegex = asStringList(data.tail_regex);
+	const negationRegex = asStringList(data.negation_regex);
+	const negationAllow = asStringList(data.negation_allow);
 	const retries = Number(data.max_retries);
+	const negRetries = Number(data.negation_max_retries);
 	const minSentences = Number(data.regex_min_sentences);
+	const negRatio = Number(data.negation_sentence_ratio);
+	const negMaxPerSentence = Number(data.negation_max_per_sentence);
 	return {
 		configPath,
 		config: {
 			enabled: data.enabled !== false,
 			max_retries: Number.isFinite(retries) && retries >= 0 ? Math.floor(retries) : 3,
+			negation_max_retries: Number.isFinite(negRetries) && negRetries >= 0 ? Math.floor(negRetries) : 1,
 			regex_min_sentences:
 				Number.isFinite(minSentences) && minSentences >= 1 ? Math.floor(minSentences) : 2,
+			negation_sentence_ratio:
+				Number.isFinite(negRatio) && negRatio >= 1 ? Math.floor(negRatio) : 3,
+			negation_max_per_sentence:
+				Number.isFinite(negMaxPerSentence) && negMaxPerSentence >= 1 ? Math.floor(negMaxPerSentence) : 2,
 			keywords,
 			regex,
 			tail_regex: tailRegex,
+			negation_regex: negationRegex,
+			negation_allow: negationAllow,
 		},
 	};
 }
@@ -268,7 +289,14 @@ export type CompiledRules = {
 	keywordFastRegex: RegExp | null;
 	regexes: CompiledRegex[];
 	tailRegexes: CompiledRegex[];
+	negationRegexes: CompiledRegex[];
+	negationAllowRegex: RegExp | null;
 	errors: string[];
+};
+
+export type TypedSentence = {
+	text: string;
+	isHeading: boolean;
 };
 
 const RE_ASCII_LETTER = /[A-Za-z]/;
@@ -277,22 +305,29 @@ const RE_NON_NEWLINE = /[^\n]/g;
 const RE_FENCE_BACKTICK = /```[\s\S]*?```/g;
 const RE_FENCE_TILDE = /~~~[\s\S]*?~~~/g;
 const RE_INLINE_CODE = /`[^`\n]*`/g;
-const RE_FILE_LINK = /\[[^\]]*\]\(file:\/\/[^\s)]+\)/g;
+const RE_LOCAL_URI_LINK = /\[[^\]]*\]\((?:file|vscode):\/\/[^\s)]+\)/g;
 const RE_HTTP_URL = /https?:\/\/\S+/g;
 const RE_WIN_PATH = /[A-Za-z]:\\[^\s]+/g;
 const RE_MD_TABLE_ROW = /^\|.*\|$/gm;
 const RE_BLOCKQUOTE_LINE = /^\s*>.*$/gm;
-const RE_SENTENCE_SPLIT = /\n\s*\n|[。！？!?]+|\.(?=\s|$)/;
+const RE_HORIZONTAL_RULE = /^(?:---+|\*\*\*+|___+)$/;
+const RE_HEADING_LINE = /^#{1,6}\s+(.*)$/;
+const RE_LIST_PREFIX = /^(?:[-*+]|\d+[.)])\s+/;
+const RE_INTRA_LINE_SENTENCE_SPLIT = /[。！？!?]+|(?<!^(?:\d+\.)*\d+)\.(?=\s|$)/;
 const RE_SENTENCE_WITH_PUNCT = /[^。！？!?\n]+(?:[。！？!?]+|$)/g;
+const RE_LEADING_NEG_DELIM = /^[，,；;：:、\s]+/;
 const MARKER_PREFIX = "<!-- plain-check:";
 const MAX_NOTICE_CACHE = 64;
 
-export function compileRegexes(patterns: string[]): { regexes: CompiledRegex[]; errors: string[] } {
+export function compileRegexes(
+	patterns: string[],
+	flags = "i",
+): { regexes: CompiledRegex[]; errors: string[] } {
 	const regexes: CompiledRegex[] = [];
 	const errors: string[] = [];
 	for (const pattern of patterns) {
 		try {
-			regexes.push({ pattern, regex: new RegExp(pattern, "i") });
+			regexes.push({ pattern, regex: new RegExp(pattern, flags) });
 		} catch (error) {
 			errors.push(`${pattern}: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -317,7 +352,20 @@ export function compileRules(config: Config, precompiledRegexes?: CompiledRegex[
 	const keywordFastRegex =
 		escapedParts.length > 0 ? new RegExp(escapedParts.join("|"), hasAsciiKeyword ? "i" : "") : null;
 
+	const allowItems = [...(config.negation_allow ?? [])]
+		.filter((w) => w.length > 0)
+		.sort((a, b) => b.length - a.length);
+	const hasAsciiAllow = allowItems.some((w) => RE_ASCII_LETTER.test(w));
+	const negationAllowRegex =
+		allowItems.length > 0
+			? new RegExp(
+					allowItems.map((w) => w.replace(RE_REGEX_ESCAPE, "\\$&")).join("|"),
+					hasAsciiAllow ? "gi" : "g",
+				)
+			: null;
+
 	const compiledTail = compileRegexes(config.tail_regex ?? []);
+	const compiledNegation = compileRegexes(config.negation_regex ?? [], "gi");
 	if (precompiledRegexes) {
 		return {
 			keywords,
@@ -325,7 +373,9 @@ export function compileRules(config: Config, precompiledRegexes?: CompiledRegex[
 			keywordFastRegex,
 			regexes: precompiledRegexes,
 			tailRegexes: compiledTail.regexes,
-			errors: compiledTail.errors,
+			negationRegexes: compiledNegation.regexes,
+			negationAllowRegex,
+			errors: [...compiledTail.errors, ...compiledNegation.errors],
 		};
 	}
 	const compiled = compileRegexes(config.regex);
@@ -335,7 +385,9 @@ export function compileRules(config: Config, precompiledRegexes?: CompiledRegex[
 		keywordFastRegex,
 		regexes: compiled.regexes,
 		tailRegexes: compiledTail.regexes,
-		errors: [...compiled.errors, ...compiledTail.errors],
+		negationRegexes: compiledNegation.regexes,
+		negationAllowRegex,
+		errors: [...compiled.errors, ...compiledTail.errors, ...compiledNegation.errors],
 	};
 }
 
@@ -348,22 +400,42 @@ export function maskText(text: string): string {
 	let out = text;
 	if (out.includes("```")) out = out.replace(RE_FENCE_BACKTICK, blank);
 	if (out.includes("~~~")) out = out.replace(RE_FENCE_TILDE, blank);
+	if (out.includes(">")) out = out.replace(RE_BLOCKQUOTE_LINE, blank);
 	if (out.includes("`")) out = out.replace(RE_INLINE_CODE, blank);
-	if (out.includes("](file://")) out = out.replace(RE_FILE_LINK, blank);
+	if (out.includes("](file://") || out.includes("](vscode://")) {
+		out = out.replace(RE_LOCAL_URI_LINK, blank);
+	}
 	if (out.includes("http://") || out.includes("https://")) out = out.replace(RE_HTTP_URL, blank);
 	if (out.includes(":\\")) out = out.replace(RE_WIN_PATH, blank);
 	if (out.includes("|")) out = out.replace(RE_MD_TABLE_ROW, blank);
 	return out;
 }
 
-export function splitSentences(text: string): string[] {
-	const rawParts = text.split(RE_SENTENCE_SPLIT);
-	const out: string[] = [];
-	for (let i = 0; i < rawParts.length; i += 1) {
-		const trimmed = rawParts[i]!.trim();
-		if (trimmed.length > 0) out.push(trimmed);
+export function splitTypedSentences(text: string): TypedSentence[] {
+	const lines = text.split(/\r?\n/);
+	const out: TypedSentence[] = [];
+	for (let i = 0; i < lines.length; i += 1) {
+		const trimmedLine = lines[i]!.trim();
+		if (!trimmedLine || RE_HORIZONTAL_RULE.test(trimmedLine)) continue;
+
+		const headingMatch = RE_HEADING_LINE.exec(trimmedLine);
+		const isHeading = Boolean(headingMatch);
+		const body = isHeading
+			? headingMatch![1]!.trim()
+			: trimmedLine.replace(RE_LIST_PREFIX, "").trim();
+		if (!body) continue;
+
+		const parts = body.split(RE_INTRA_LINE_SENTENCE_SPLIT);
+		for (let p = 0; p < parts.length; p += 1) {
+			const chunk = parts[p]!.trim();
+			if (chunk.length > 0) out.push({ text: chunk, isHeading });
+		}
 	}
 	return out;
+}
+
+export function splitSentences(text: string): string[] {
+	return splitTypedSentences(text).map((s) => s.text);
 }
 
 export function extractTailSegment(maskedText: string): string {
@@ -383,6 +455,44 @@ export function extractTailSegment(maskedText: string): string {
 
 function isCompiledRules(arg: CompiledRegex[] | CompiledRules | undefined): arg is CompiledRules {
 	return Boolean(arg && !Array.isArray(arg) && "regexes" in arg);
+}
+
+function countSentenceNegations(sentence: string, rules: CompiledRules): number {
+	const cleaned = rules.negationAllowRegex ? sentence.replace(rules.negationAllowRegex, blank) : sentence;
+	const spans: Array<{ start: number; end: number }> = [];
+	for (let r = 0; r < rules.negationRegexes.length; r += 1) {
+		const re = rules.negationRegexes[r]!.regex;
+		re.lastIndex = 0;
+		let matched: RegExpExecArray | null;
+		while ((matched = re.exec(cleaned)) !== null) {
+			const raw = matched[0] ?? "";
+			if (raw.length === 0) {
+				re.lastIndex += 1;
+				continue;
+			}
+			const trimmed = raw.replace(RE_LEADING_NEG_DELIM, "");
+			const tokenLen = (trimmed || raw).length;
+			const start = matched.index + (raw.length - tokenLen);
+			const end = matched.index + raw.length;
+			spans.push({ start, end });
+		}
+	}
+	if (spans.length <= 1) return spans.length;
+	spans.sort((a, b) => a.start - b.start || b.end - b.start - (a.end - a.start));
+	let count = 0;
+	let lastEnd = -1;
+	for (let i = 0; i < spans.length; i += 1) {
+		const span = spans[i]!;
+		if (span.start < lastEnd) continue;
+		count += 1;
+		lastEnd = span.end;
+	}
+	return count;
+}
+
+export function computeNegationBudget(proseSentenceCount: number, ratio = 3): number {
+	if (proseSentenceCount <= 2) return 1;
+	return Math.max(2, Math.ceil(proseSentenceCount / Math.max(1, ratio)));
 }
 
 export function auditText(
@@ -414,10 +524,12 @@ export function auditText(
 		}
 	}
 
+	const needTypedSentences = rules.regexes.length > 0 || rules.negationRegexes.length > 0;
+	const typedSentences = needTypedSentences ? splitTypedSentences(masked) : [];
+
 	if (rules.regexes.length > 0) {
 		const minSentences = config.regex_min_sentences;
-		const sentences = splitSentences(masked);
-		const sentenceCount = sentences.length;
+		const sentenceCount = typedSentences.length;
 		if (sentenceCount >= minSentences) {
 			for (let r = 0; r < rules.regexes.length; r += 1) {
 				const compiled = rules.regexes[r]!;
@@ -425,7 +537,7 @@ export function auditText(
 				let first = "";
 				for (let s = 0; s < sentenceCount; s += 1) {
 					if (count + (sentenceCount - s) < minSentences) break;
-					const sentence = sentences[s]!;
+					const sentence = typedSentences[s]!.text;
 					if (!first) {
 						const matched = compiled.regex.exec(sentence);
 						if (!matched) continue;
@@ -444,6 +556,52 @@ export function auditText(
 					});
 				}
 			}
+		}
+	}
+
+	if (rules.negationRegexes.length > 0 && typedSentences.length > 0) {
+		const ratio = config.negation_sentence_ratio ?? 3;
+		const maxPerSentence = config.negation_max_per_sentence ?? 2;
+		let proseSentenceCount = 0;
+		let totalNegations = 0;
+		let maxInSingleSentence = 0;
+		let worstSentence = "";
+		const hitSamples: string[] = [];
+
+		for (let s = 0; s < typedSentences.length; s += 1) {
+			const entry = typedSentences[s]!;
+			if (!entry.isHeading) proseSentenceCount += 1;
+			const negCount = countSentenceNegations(entry.text, rules);
+			if (negCount > 0) {
+				totalNegations += negCount;
+				if (hitSamples.length < 3) {
+					const compact = entry.text.replace(/\s+/g, " ").trim();
+					hitSamples.push(compact.length > 32 ? `${compact.slice(0, 29)}...` : compact);
+				}
+				if (negCount > maxInSingleSentence) {
+					maxInSingleSentence = negCount;
+					worstSentence = entry.text;
+				}
+			}
+		}
+
+		const budget = computeNegationBudget(proseSentenceCount, ratio);
+		if (maxInSingleSentence > maxPerSentence) {
+			hits.push({
+				kind: "negation",
+				rule: "单句否定堆叠",
+				match: worstSentence,
+				count: maxInSingleSentence,
+				budget: maxPerSentence,
+			});
+		} else if (totalNegations > budget) {
+			hits.push({
+				kind: "negation",
+				rule: "否定密度超标",
+				match: hitSamples.join(" / "),
+				count: totalNegations,
+				budget,
+			});
 		}
 	}
 
@@ -473,42 +631,71 @@ export function stripMarkers(text: string): string {
 	return text.replaceAll(MARKER_RETRY, "").replaceAll(MARKER_STOP, "");
 }
 
-export function renderNotice(hits: Hit[], stopped: boolean): string {
+function formatHitSummary(hits: Hit[]): string {
 	const labels = hits.map((hit) => {
+		if (hit.kind === "negation" && hit.budget !== undefined) {
+			return `${hit.rule} (${hit.count}/${hit.budget})`;
+		}
 		const text = (hit.match || hit.rule).replace(/\s+/g, " ").trim();
 		const clipped = text.length > 60 ? `${text.slice(0, 57)}...` : text;
 		const count = hit.count > 1 ? ` ×${hit.count}${hit.kind === "regex" ? " 句" : ""}` : "";
 		return `${clipped}${count}`;
 	});
 	const shown = labels.slice(0, 6);
-	const more = labels.length > shown.length ? ` 等 ${labels.length} 处` : "";
-	const lines = [
-		stopped ? "> ⚠️ 重写后仍不合规，已回滚并停止" : "> ⚠️ 输出不合规，已回滚",
-		`> 命中：${shown.length ? shown.join("、") + more : "黑名单规则"}`,
-	];
-	if (!stopped) lines.push("> 正在重新生成…");
-	return lines.join("\n");
+	const more = labels.length > shown.length ? ` 等 ${labels.length} 项` : "";
+	return shown.length ? shown.join("、") + more : "黑名单规则";
+}
+
+export function renderNotice(hits: Hit[], stopped: boolean): string {
+	const summary = formatHitSummary(hits);
+	if (stopped) {
+		return `> ⚠️ 文风自动改写已达上限（命中：${summary}）；原回复保留。`;
+	}
+	return [`> ⚠️ 输出不合规，已回滚`, `> 命中：${summary}`, `> 正在原位改写…`].join("\n");
+}
+
+export function renderStoppedReply(hits: Hit[], body: string): string {
+	const notice = renderNotice(hits, true);
+	const trimmed = body.trim();
+	return trimmed ? `${notice}\n\n${body}` : notice;
 }
 
 export function buildFeedback(hits: Hit[], originalDraft?: string): string {
 	const rules = hits.map((hit) => {
 		const matched = (hit.match || hit.rule).replace(/\s+/g, " ").trim();
 		const clipped = matched.length > 80 ? `${matched.slice(0, 77)}...` : matched;
-		const count = hit.count > 1 ? `，${hit.count} ${hit.kind === "regex" ? "句" : "次"}` : "";
 		if (hit.kind === "tail_regex") {
 			return `末尾追问/客套规则 ${hit.rule}（匹配：${clipped}）`;
 		}
+		if (hit.kind === "negation") {
+			const limitInfo =
+				hit.budget !== undefined ? `计 ${hit.count} 次，上限 ${hit.budget}` : `${hit.count} 次`;
+			return `${hit.rule}（${limitInfo}；定位：${clipped}）`;
+		}
+		const count = hit.count > 1 ? `，${hit.count} ${hit.kind === "regex" ? "句" : "次"}` : "";
 		return hit.kind === "regex"
 			? `${hit.rule}（匹配：${clipped}${count}）`
 			: `${hit.rule}${count}`;
 	});
 	const uniqueRules = [...new Set(rules)];
+	const onlyTail = hits.length > 0 && hits.every((h) => h.kind === "tail_regex");
 	const hasTailHit = hits.some((h) => h.kind === "tail_regex");
-	const instruction = hasTailHit
-		? "请重写你上一条回复。保留事实、代码、命令和结论；直接删除末尾未授权的追问、菜单式选择题或客套话；不要解释，不要提审查；只输出改写后的回复。"
-		: "请重写你上一条回复。保留事实、代码、命令和结论；不要解释，不要提审查；只输出改写后的回复。";
+	const hasNegationHit = hits.some((h) => h.kind === "negation");
+	let instruction: string;
+	if (onlyTail) {
+		instruction =
+			"请基于上一条回复，直接删除末尾未授权的追问、菜单式选择题或客套话；其余段落、数据、代码、命令与结论逐字原样保留；不要解释，不要提审查，直接输出修改后的完整回复。";
+	} else if (hasNegationHit) {
+		instruction = hasTailHit
+			? "请仅原位改写命中的否定堆叠句子（改为肯定句陈述当前落点、变更范围与下一步，保留真实阻塞项），并直接删除末尾未授权追问或客套话；其余未命中的段落、数据、代码、命令与结论逐字原样保留；不要解释，不要提审查，直接输出修改后的完整回复。"
+			: "请仅原位改写命中的否定堆叠句子（改为肯定句陈述当前落点、变更范围与下一步，保留真实阻塞项）；其余未命中的段落、数据、代码、命令与结论逐字原样保留；不要解释，不要提审查，直接输出修改后的完整回复。";
+	} else {
+		instruction = hasTailHit
+			? "请仅原位改写命中的句子，并直接删除末尾未授权追问或客套话；其余未命中的段落、数据、代码、命令与结论逐字原样保留；不要解释，不要提审查，直接输出修改后的完整回复。"
+			: "请仅原位改写命中的句子；其余未命中的段落、数据、代码、命令与结论逐字原样保留；不要解释，不要提审查，直接输出修改后的完整回复。";
+	}
 	const lines = [
-		"你上一条回复被回滚了，因为命中了黑名单：",
+		"你上一条回复命中了文风规则：",
 		...uniqueRules.map((rule) => `- ${rule}`),
 		"",
 		instruction,
@@ -550,6 +737,26 @@ function textOf(message: any): string {
 	return parts.join("\n");
 }
 
+function hasRetryMarker(message: any): boolean {
+	if (message?.role !== "assistant" || !Array.isArray(message.content)) return false;
+	for (let i = 0; i < message.content.length; i += 1) {
+		const block = message.content[i];
+		if (block?.type === "text" && typeof block.text === "string" && block.text.includes(MARKER_RETRY)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function isSupersededByLaterAssistant(messages: any[], index: number): boolean {
+	for (let k = index + 1; k < messages.length; k += 1) {
+		const role = messages[k]?.role;
+		if (role === "user") return false;
+		if (role === "assistant") return true;
+	}
+	return false;
+}
+
 function markMessage(message: any, marker: string): any {
 	return {
 		...message,
@@ -569,7 +776,11 @@ export function rollbackMessage(
 	tui: boolean,
 ): any {
 	if (tui) return markMessage(message, marker);
-	return { ...message, content: [{ type: "text", text: marker + renderNotice(hits, stopped) }] };
+	if (stopped) {
+		const body = stripMarkers(textOf(message));
+		return { ...message, content: [{ type: "text", text: marker + renderStoppedReply(hits, body) }] };
+	}
+	return { ...message, content: [{ type: "text", text: marker + renderNotice(hits, false) }] };
 }
 
 function logAudit(message: any, hits: Hit[], action: "retry" | "stopped"): void {
@@ -578,14 +789,20 @@ function logAudit(message: any, hits: Hit[], action: "retry" | "stopped"): void 
 		provider: message.provider,
 		model: message.model,
 		action,
-		hits: hits.map((hit) => ({ kind: hit.kind, rule: hit.rule, match: hit.match, count: hit.count })),
+		hits: hits.map((hit) => ({
+			kind: hit.kind,
+			rule: hit.rule,
+			match: hit.match,
+			count: hit.count,
+			...(hit.budget !== undefined ? { budget: hit.budget } : {}),
+		})),
 	})}\n`;
 	void fs.promises.appendFile(LOG_PATH, line, "utf8").catch(() => {
 		// Logging must not break the reply.
 	});
 }
 
-function setStatus(ctx: any, text: string): void {
+function setStatus(ctx: any, text: string | undefined): void {
 	if (ctx?.hasUI) ctx.ui.setStatus("plain-check", text);
 }
 
@@ -595,6 +812,20 @@ function cacheNotice(cache: Map<string, string>, key: string, value: string): vo
 		if (oldest !== undefined) cache.delete(oldest);
 	}
 	cache.set(key, value);
+}
+
+function totalRuleCount(rules: CompiledRules): number {
+	return (
+		rules.keywords.length +
+		rules.regexes.length +
+		rules.negationRegexes.length +
+		rules.tailRegexes.length
+	);
+}
+
+function isSubagentChild(): boolean {
+	const raw = process.env.PI_SUBAGENT_CHILD?.trim().toLowerCase();
+	return Boolean(raw && raw !== "0" && raw !== "false");
 }
 
 export default function plainCheck(pi: ExtensionAPI): void {
@@ -621,9 +852,11 @@ export default function plainCheck(pi: ExtensionAPI): void {
 			if (ctx.hasUI && rules.errors.length > 0) {
 				ctx.ui.notify(`plain-check: ${rules.errors.length} 条 regex 无效，已跳过`, "warning");
 			}
-			if (ctx.hasUI) {
-				const count = rules.keywords.length + rules.regexes.length + rules.tailRegexes.length;
-				ctx.ui.setStatus("plain-check", config.enabled ? `plain-check: ${count} 条` : "plain-check: off");
+			if (ctx.hasUI && (ctx as any).mode === "tui") {
+				ctx.ui.setStatus(
+					"plain-check",
+					config.enabled ? `plain-check: ${totalRuleCount(rules)} 条` : "plain-check: off",
+				);
 			}
 		} catch (error) {
 			config = { ...DEFAULT_CONFIG, enabled: false };
@@ -643,7 +876,7 @@ export default function plainCheck(pi: ExtensionAPI): void {
 	});
 
 	pi.on("message_end", async (event, ctx) => {
-		if (!config.enabled) return;
+		if (!config.enabled || isSubagentChild()) return;
 		const message = event.message as any;
 		if (!isFinalAssistant(message)) return;
 		const draft = textOf(message);
@@ -651,31 +884,36 @@ export default function plainCheck(pi: ExtensionAPI): void {
 		const hits = auditText(draft, config, rules);
 		if (hits.length === 0) {
 			pendingRewrite = false;
-			setStatus(ctx, "plain-check: ok");
+			setStatus(ctx, undefined);
 			return;
 		}
 
 		const tui = (ctx as any).mode === "tui";
-		const canRetry = attempts < config.max_retries;
+		const cleanDraft = stripMarkers(draft);
+		const onlyNegation = hits.every((h) => h.kind === "negation");
+		const effectiveMaxRetries = onlyNegation
+			? Math.min(config.max_retries, config.negation_max_retries ?? 1)
+			: config.max_retries;
+		const canRetry = attempts < effectiveMaxRetries;
 		if (!canRetry) {
 			logAudit(message, hits, "stopped");
 			pendingRewrite = false;
-			setStatus(ctx, `plain-check: ${hits.length} 处，已停止`);
+			setStatus(ctx, `plain-check: 命中 ${hits.length} 项，保留原回复`);
 			const rolled = rollbackMessage(message, MARKER_STOP, hits, true, tui);
 			if (tui) {
-				cacheNotice(noticeCache, textOf(rolled), renderNotice(hits, true));
+				cacheNotice(noticeCache, textOf(rolled), renderStoppedReply(hits, cleanDraft));
 			}
 			return { message: rolled };
 		}
 
 		attempts += 1;
 		logAudit(message, hits, "retry");
-		setStatus(ctx, `plain-check: ${hits.length} 处，重写中`);
+		setStatus(ctx, `plain-check: 命中 ${hits.length} 项，重写中 (${attempts}/${effectiveMaxRetries})`);
 		try {
 			pi.sendMessage(
 				{
 					customType: REWRITE_TYPE,
-					content: buildFeedback(hits, tui ? undefined : draft),
+					content: buildFeedback(hits, tui ? undefined : cleanDraft),
 					display: false,
 				},
 				{ deliverAs: "followUp", triggerTurn: true },
@@ -685,13 +923,13 @@ export default function plainCheck(pi: ExtensionAPI): void {
 			pendingRewrite = false;
 			const rolled = rollbackMessage(message, MARKER_STOP, hits, true, tui);
 			if (tui) {
-				cacheNotice(noticeCache, textOf(rolled), renderNotice(hits, true));
+				cacheNotice(noticeCache, textOf(rolled), renderStoppedReply(hits, cleanDraft));
 			}
 			return { message: rolled };
 		}
 		const rolled = rollbackMessage(message, MARKER_RETRY, hits, false, tui);
 		if (tui) {
-			cacheNotice(noticeCache, textOf(rolled), renderNotice(hits, false));
+			cacheNotice(noticeCache, textOf(rolled), cleanDraft);
 		}
 		return { message: rolled };
 	});
@@ -707,7 +945,7 @@ export default function plainCheck(pi: ExtensionAPI): void {
 		const cached = noticeCache.get(markdown);
 		if (cached !== undefined) return cached;
 		const text = stripMarkers(markdown);
-		const rendered = renderNotice(auditText(text, config, rules), marker === MARKER_STOP);
+		const rendered = marker === MARKER_STOP ? renderStoppedReply(auditText(text, config, rules), text) : text;
 		cacheNotice(noticeCache, markdown, rendered);
 		return rendered;
 	});
@@ -748,6 +986,9 @@ export default function plainCheck(pi: ExtensionAPI): void {
 				continue;
 			}
 			if (hasMarkedAssistant && msg?.role === "assistant" && Array.isArray(msg.content)) {
+				if (hasRetryMarker(msg) && isSupersededByLaterAssistant(rawMessages, i)) {
+					continue;
+				}
 				let blockChanged = false;
 				const nextContent = msg.content.map((block: any) => {
 					if (block?.type === "text" && typeof block.text === "string" && block.text.includes(MARKER_PREFIX)) {
@@ -828,7 +1069,7 @@ export default function plainCheck(pi: ExtensionAPI): void {
 				if (action === "reload") {
 					applyConfig();
 					notify(
-						`已重载：${rules.keywords.length} keyword，${rules.regexes.length} regex，${rules.tailRegexes.length} tail_regex，max_retries=${config.max_retries}`,
+						`已重载：${rules.keywords.length} keyword，${rules.regexes.length} regex，${rules.negationRegexes.length} negation，${rules.tailRegexes.length} tail_regex，max_retries=${config.max_retries}`,
 						"info",
 					);
 					if (rules.errors.length > 0) {
@@ -839,12 +1080,13 @@ export default function plainCheck(pi: ExtensionAPI): void {
 
 				if (action === "on" || action === "off") {
 					config = { ...config, enabled: action === "on" };
+					setStatus(ctx, config.enabled ? undefined : "plain-check: off");
 					notify(`plain-check ${config.enabled ? "on" : "off"}`, "info");
 					return;
 				}
 
 				notify(
-					`plain-check ${config.enabled ? "on" : "off"}；${rules.keywords.length} keyword，${rules.regexes.length} regex，${rules.tailRegexes.length} tail_regex；max_retries=${config.max_retries}；配置：${activeConfigPath}`,
+					`plain-check ${config.enabled ? "on" : "off"}；${rules.keywords.length} keyword，${rules.regexes.length} regex，${rules.negationRegexes.length} negation，${rules.tailRegexes.length} tail_regex；max_retries=${config.max_retries}；配置：${activeConfigPath}`,
 					"info",
 				);
 			} catch (error) {

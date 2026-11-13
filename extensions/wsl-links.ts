@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const PLAIN_CHECK_MARKER = "<!-- plain-check:";
 const MAX_TRANSFORM_CACHE = 256;
 const MAX_STAT_CACHE = 512;
 
@@ -239,7 +238,7 @@ function transformInlineLine(line: string, options: Required<WslLinkOptions>): s
 }
 
 export function rewriteWslMarkdownLinks(markdown: string, options: WslLinkOptions): string {
-  if (!markdown || markdown.startsWith(PLAIN_CHECK_MARKER)) {
+  if (!markdown) {
     return markdown;
   }
   if (!markdown.includes("](") && !markdown.includes("`")) {
@@ -299,7 +298,7 @@ export default function wslLinks(pi: ExtensionAPI): void {
   const renderCache = new Map<string, string>();
 
   (pi as any).registerMarkdownTransformer((markdown: string) => {
-    if (!markdown || markdown.startsWith(PLAIN_CHECK_MARKER)) {
+    if (!markdown) {
       return markdown;
     }
     const cached = renderCache.get(markdown);

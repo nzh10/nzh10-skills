@@ -1,43 +1,29 @@
 # plain-check
 # Seed rules adapted from IndenScale/slop-lint rulesets/zh.toml (MIT).
-# slop-lint's density rules are flattened to plain blacklist entries here.
+# Strict rhetoric stays in keywords/regex/tail_regex; ordinary negation uses length-adaptive density budgets.
 
 enabled = true
 max_retries = 3
+negation_max_retries = 1
 regex_min_sentences = 2
+negation_sentence_ratio = 3
+negation_max_per_sentence = 2
 
 keywords = [
   "不代表",
   "不能把",
   "不能直接",
-  "仍未补齐",
   "不能冒充",
   "而不是",
   "不表示",
-  "尚未确认",
-  "尚未落地",
-  "尚未执行",
-  "，不再",
-  "，尚未",
-  "，没有",
   "，不把",
-  "，未作",
   "，避免",
   "，不等于",
   "，不保证",
-  "不单独列为",
-  "不足以说明",
   "不足以证明",
-  "不能断言",
-  "不能说明",
-  "不能视为",
   "不完全",
   "只能说明",
-  "不证明",
   "不能确定",
-  "无法说明",
-  "不能断定",
-  "不能仅靠",
   "不能当作",
   "不能承诺",
   "无法证明",
@@ -46,20 +32,32 @@ keywords = [
   "不能据此",
   "夹具",
   "探针",
-  "门禁",
-  "，也不能",
 ]
 
-# 每条 regex 单独计数：pattern 在几个句子里出现，就是 ×几。
-# 句内不限字符数；同一个句子里出现多次也只算 1。
+# 每条 regex 单独按命中句数计数；满 regex_min_sentences 句触发。
 regex = [
-  '不是[\s\S]*?(而?是|也不)',
-  '不把[\s\S]*?说成',
-  '是[\s\S]*?不是',
-  '，(不[^过但]|避免)',
-  '(尚?未|还没|不再)',
+  '不是[^\n]*?(而?是|也不)',
+  '是[^\n]*?不是',
+  '(?:尚?未|还没|没(?:有)?)(?:提交|推送|暂存|重启|发版|改动|修改)',
   '(仍|另)(需|缺|未|待|是|显示)',
   '实测',
+]
+
+# 普通否定密度层：先遮罩 negation_allow 中的固化双音常词，再按有效句数动态预算与单句上限双重判定。
+negation_regex = [
+  '尚?未|还没|不再|没有|(?<![吞淹沉湮埋出覆罚])没(?!错|收)',
+  '(?:^|[，,；;：:、])\s*(?:也|并|既|且|却|都|又)?不',
+]
+
+negation_allow = [
+  "未来",
+  "不过",
+  "不同",
+  "不断",
+  "不仅",
+  "不但",
+  "不止",
+  "不错",
 ]
 
 # 仅检查回复末尾收尾句（保留问号等标点，忽略代码块与引用块），单次命中即回滚重写。

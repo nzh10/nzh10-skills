@@ -6,12 +6,13 @@ import * as path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import {
+import registerPlainCheck, {
   auditText,
   buildFeedback,
   compileRules,
   extractTailSegment,
   loadConfig,
+  splitTypedSentences,
 } from "../extensions/plain-check.ts";
 import registerPiSteward, {
   computeStewardDiff,
@@ -72,7 +73,7 @@ test("plain-check tail_regex has zero false positives on blockers, engineering p
   );
 });
 
-test("plain-check buildFeedback preserves original draft in non-TUI mode", () => {
+test("plain-check buildFeedback preserves original draft in non-TUI mode and requests in-place edits", () => {
   const draft = "已完成提交 abc1234。需要我顺手推上去吗？";
   const fbHeadless = buildFeedback(
     [{ kind: "tail_regex", rule: "需要我.*[吗？?]", match: "需要我顺手推上去吗？", count: 1 }],
@@ -81,9 +82,269 @@ test("plain-check buildFeedback preserves original draft in non-TUI mode", () =>
   assert.match(fbHeadless, /<previous_draft>[\s\S]*abc1234[\s\S]*<\/previous_draft>/);
 
   const fbTui = buildFeedback([
-    { kind: "tail_regex", rule: "需要我.*[吗？?]", match: "需要我顺手推上去吗？", count: 1 },
+    { kind: "negation", rule: "否定密度超标", match: "已改好，未提交、未推送", count: 2, budget: 1 },
   ]);
   assert.doesNotMatch(fbTui, /<previous_draft>/);
+  assert.match(fbTui, /仅原位改写/);
+});
+
+test("plain-check negation density blocks short-reply piling, single-sentence enumeration, and repeated action disclaimers while sparing long reports", () => {
+  const { config } = loadConfig(CANON_TOML);
+  const rules = compileRules(config);
+
+  // 1. Short reply piling (S=1, budget=1, N=2)
+  const shortPile = auditText("已更新配置，未提交、未推送。", config, rules);
+  assert.ok(shortPile.some((h) => h.kind === "negation" && h.count === 2 && h.budget === 1));
+
+  // 2. Two short sentences with ordinary negations (S=2, budget=1, N=2)
+  const twoSentencePile = auditText("路由表没动。连接池没有重建。", config, rules);
+  assert.ok(twoSentencePile.some((h) => h.kind === "negation" && h.count === 2 && h.budget === 1));
+
+  // 3. Single-sentence 3-item enumeration even inside a long report (M=3 > 2)
+  const filler = Array.from({ length: 8 }, (_, idx) => `第 ${idx + 1} 步已完成校验并记录指标。`).join("");
+  const enumInLong = auditText(`${filler}本次仅调整入口参数：没改A、没动B、未开启C。`, config, rules);
+  assert.ok(enumInLong.some((h) => h.kind === "negation" && h.rule === "单句否定堆叠" && h.count === 3));
+
+  const buEnum = auditText("不改配置、不动数据库、也不开启灰度开关。", config, rules);
+  assert.ok(buEnum.some((h) => h.kind === "negation" && h.rule === "单句否定堆叠" && h.count === 3));
+
+  // 4. Long 12-sentence report with 3 scattered ordinary negations passes (budget=4)
+  const longCleanReport = [
+    "已完成日志聚合模块重构并通过集成回归。",
+    "采样器默认窗口收敛为 30 秒。",
+    "冷启动阶段缓存尚未预热，首包走磁盘回源。",
+    "压缩器切换到流式写入模式。",
+    "历史归档目录保持只读挂载。",
+    "压测期间内存曲线没有出现抖动。",
+    "指标上报格式与现有看板完全对齐。",
+    "批处理队列吞吐提升至每秒 4200 条。",
+    "异常重试退避上限固定为 8 秒。",
+    "旧版迁移脚本不再随守护进程启动。",
+    "所有改动保存在本地工作区。",
+    "单测与仓库自检全部通过。",
+  ].join("");
+  assert.deepEqual(auditText(longCleanReport, config, rules), []);
+
+  // 5. Cross-sentence repeated unperformed-action disclaimers caught even in a long report
+  const repeatedDisclaimers = [
+    ...Array.from({ length: 8 }, (_, idx) => `模块 ${idx + 1} 已完成静态检查。`),
+    "核心补丁已落盘，尚未提交。",
+    "远端分支保持原状，未推送。",
+  ].join("");
+  const disclaimerHits = auditText(repeatedDisclaimers, config, rules);
+  assert.ok(
+    disclaimerHits.some((h) => h.kind === "regex" && h.rule.includes("提交|推送")),
+    `Expected repeated disclaimer regex hit, got: ${JSON.stringify(disclaimerHits)}`,
+  );
+});
+
+test("plain-check deduplicates overlapping spans, exempts lexicalized words and mò compounds, and excludes headings from budget", () => {
+  const { config } = loadConfig(CANON_TOML);
+  const rules = compileRules(config);
+
+  // Overlapping '，不再' / '尚未' / '没有' count once, so a single-clause reply passes (budget=1)
+  assert.deepEqual(auditText("轮询开关已固定，不再自动重试。", config, rules), []);
+  assert.deepEqual(auditText("远端凭据尚未注入，请先导入环境变量。", config, rules), []);
+
+  // Lexicalized negation_allow words, technical compounds, and mò ('吞没'/'淹没'/'沉没') pass
+  assert.deepEqual(
+    auditText("未来规划让不同模块不断演进，不过不仅延迟不错，而且不但稳定、不止支持单机。", config, rules),
+    [],
+  );
+  assert.deepEqual(
+    auditText("当前接口与旧版协议不兼容，返回码不一致，输入队列非空。", config, rules),
+    [],
+  );
+  assert.deepEqual(
+    auditText("底层异常被吞没，关键告警被淹没，旧脚本属于沉没成本。", config, rules),
+    [],
+  );
+
+  // Body blockquotes and vscode:// URI links are masked
+  assert.deepEqual(
+    auditText(
+      "> 历史记录：这不是配置错误，而是接口超时，未提交、未推送、没有验证。\n\n详见 [未命名说明.md](vscode://vscode-remote/wsl+openSUSE-Leap-16.1/tmp/未提交/notes.md:1)，工作区修复已完成。",
+      config,
+      rules,
+    ),
+    [],
+  );
+
+  // Line-aware splitting strips ordered-list prefixes without splitting '1.' or 'v1.5.2' and flags headings
+  const typed = splitTypedSentences("## 1. 检查摘要\n1. 完成 v1.5.2 语法校验。\n2. 更新守护脚本。");
+  assert.deepEqual(typed, [
+    { text: "1. 检查摘要", isHeading: true },
+    { text: "完成 v1.5.2 语法校验", isHeading: false },
+    { text: "更新守护脚本", isHeading: false },
+  ]);
+
+  // Headings cannot inflate prose sentence count S to bypass negation density
+  const headingPadded = "## 一\n## 二\n## 三\n## 四\n## 五\n第一项未落盘。\n第二项没有生效。";
+  const paddedHits = auditText(headingPadded, config, rules);
+  assert.ok(paddedHits.some((h) => h.kind === "negation" && h.budget === 1 && h.count === 2));
+});
+
+test("plain-check runtime bypasses only PI_SUBAGENT_CHILD, preserves top-level headless <previous_draft>, keeps TUI retry draft visible, and prunes superseded drafts", async () => {
+  const tmpAgent = fs.mkdtempSync(path.join(os.tmpdir(), "plain-runtime-"));
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const prevSubagentChild = process.env.PI_SUBAGENT_CHILD;
+  process.env.PI_CODING_AGENT_DIR = tmpAgent;
+  delete process.env.PI_SUBAGENT_CHILD;
+
+  try {
+    fs.copyFileSync(CANON_TOML, path.join(tmpAgent, "plain-check.toml"));
+    const handlers = new Map<string, (...args: any[]) => any>();
+    let transformer: ((md: string, ctx: any) => string) | undefined;
+    const sentMessages: any[] = [];
+
+    const fakePi = {
+      on(event: string, fn: (...args: any[]) => any) {
+        handlers.set(event, fn);
+      },
+      registerCommand() {},
+      registerMarkdownTransformer(fn: (md: string, ctx: any) => string) {
+        transformer = fn;
+      },
+      sendMessage(msg: any) {
+        sentMessages.push(msg);
+      },
+    };
+
+    registerPlainCheck(fakePi as unknown as Parameters<typeof registerPlainCheck>[0]);
+
+    let statusValue: string | undefined = "initial";
+    const makeCtx = (mode: string) => ({
+      mode,
+      hasUI: true,
+      ui: {
+        notify() {},
+        setStatus(_key: string, text: string | undefined) {
+          statusValue = text;
+        },
+      },
+    });
+
+    await handlers.get("session_start")?.({}, makeCtx("tui"));
+    assert.match(statusValue ?? "", /^plain-check: \d+ 条$/);
+
+    // 1. Background subagent child (PI_SUBAGENT_CHILD=1) is bypassed completely
+    process.env.PI_SUBAGENT_CHILD = "1";
+    const subagentRes = await handlers.get("message_end")?.(
+      {
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "这不是重构，而是小修，未提交、未推送。" }],
+        },
+      },
+      makeCtx("rpc"),
+    );
+    assert.equal(subagentRes, undefined);
+    assert.equal(sentMessages.length, 0);
+    delete process.env.PI_SUBAGENT_CHILD;
+
+    // 2. Top-level non-TUI ('rpc' / headless) audits and forwards <previous_draft>
+    const rpcDraft = "已完成提交 abc1234。需要我顺手 push 到远端吗？";
+    const rpcRes = await handlers.get("message_end")?.(
+      {
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: rpcDraft }],
+        },
+      },
+      makeCtx("rpc"),
+    );
+    assert.equal(sentMessages.length, 1);
+    assert.match(sentMessages[0].content, /<previous_draft>[\s\S]*abc1234[\s\S]*<\/previous_draft>/);
+    assert.match(rpcRes.message.content[0].text, /^<!-- plain-check:retry -->/);
+    assert.doesNotMatch(rpcRes.message.content[0].text, /abc1234/);
+
+    // Reset turn state via new user input
+    handlers.get("input")?.({ source: "user" });
+    sentMessages.length = 0;
+
+    // 3. Clean TUI reply clears the status bar slot instead of leaving 'plain-check: ok'
+    const cleanRes = await handlers.get("message_end")?.(
+      {
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "已完成配置更新，改动保存在本地工作区。" }],
+        },
+      },
+      makeCtx("tui"),
+    );
+    assert.equal(cleanRes, undefined);
+    assert.equal(statusValue, undefined);
+
+    // 4. Negation-only hit in TUI retries once (1/1), keeps draft visible during retry, and preserves stopped draft on second hit
+    const retryRes = await handlers.get("message_end")?.(
+      {
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "第一版草稿：未提交、未推送。" }],
+        },
+      },
+      makeCtx("tui"),
+    );
+    assert.equal(sentMessages.length, 1);
+    assert.doesNotMatch(sentMessages[0].content, /<previous_draft>/);
+    assert.match(statusValue ?? "", /\(1\/1\)/);
+    const retryMarkedText = retryRes.message.content[0].text;
+    assert.match(retryMarkedText, /^<!-- plain-check:retry -->/);
+    assert.equal(transformer!(retryMarkedText, { messageType: "assistant" }), "第一版草稿：未提交、未推送。");
+
+    // During pendingRewrite, context keeps attempt 1 + feedback
+    const ctxDuringRetry = await handlers.get("context")?.({
+      messages: [
+        { role: "user", content: [{ type: "text", text: "改一下配置" }] },
+        retryRes.message,
+        { role: "custom", customType: "plain-check-rewrite", content: sentMessages[0].content },
+      ],
+    });
+    assert.equal(ctxDuringRetry.messages.length, 3);
+    assert.equal(ctxDuringRetry.messages[1].content[0].text, "第一版草稿：未提交、未推送。");
+
+    // Second negation hit reaches negation_max_retries=1 -> stops without firing another turn and keeps draft visible
+    const stopRes = await handlers.get("message_end")?.(
+      {
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "第二版正文结论：配置没动。缓存没有清。" }],
+        },
+      },
+      makeCtx("tui"),
+    );
+    assert.equal(sentMessages.length, 1);
+    assert.match(statusValue ?? "", /保留原回复/);
+    const stopMarkedText = stopRes.message.content[0].text;
+    assert.match(stopMarkedText, /^<!-- plain-check:stop -->/);
+    const renderedStop = transformer!(stopMarkedText, { messageType: "assistant" });
+    assert.match(renderedStop, /原回复保留/);
+    assert.match(renderedStop, /第二版正文结论：配置没动。缓存没有清。/);
+
+    // Context hook prunes superseded attempt 1 and feedback, leaving clean [user, attempt 2]
+    const ctxAfterStop = await handlers.get("context")?.({
+      messages: [
+        { role: "user", content: [{ type: "text", text: "改一下配置" }] },
+        retryRes.message,
+        { role: "custom", customType: "plain-check-rewrite", content: sentMessages[0].content },
+        stopRes.message,
+      ],
+    });
+    assert.equal(ctxAfterStop.messages.length, 2);
+    assert.equal(ctxAfterStop.messages[0].role, "user");
+    assert.equal(ctxAfterStop.messages[1].content[0].text, "第二版正文结论：配置没动。缓存没有清。");
+  } finally {
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    if (prevSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+    else process.env.PI_SUBAGENT_CHILD = prevSubagentChild;
+    fs.rmSync(tmpAgent, { recursive: true, force: true });
+  }
 });
 
 test("pi-steward evaluateToolCallGuard blocks only hook-bypass flags and imposes zero barrier on git push or skill-creator edits", () => {
