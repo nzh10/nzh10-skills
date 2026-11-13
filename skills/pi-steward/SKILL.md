@@ -10,7 +10,7 @@ description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（c
 ## 四条不可逾越的红线
 
 1. **未经明确指示绝不自动 Promote 或 Push**：仅当用户明确要求「存进沉淀池」或「promote / 转正到全局」时才写入仓库或推送。
-2. **只读同步节点不改包缓存**：若 `<agentDir>/machine.json` 无有效 `hubRepoPath`，当前机器即为只读同步节点（仅通过 `pi install git:github.com/nzh10/nzh10-skills` 接收同步），保持 `<agentDir>/git/...` 包缓存只读；需改全局配置时，直接用一句话说明当前为只读同步节点，引导在主力开发机操作或先克隆仓库运行 `/hub-init <machineId> <hubRepoPath>`。
+2. **只读同步节点严禁手改包缓存**：若 `<agentDir>/machine.json` 无有效 `hubRepoPath`，当前机器即为只读同步节点（由 `pi-steward` 在交互式启动与 `/reload` 时自动拉取并硬重置 `<agentDir>/git/github.com/nzh10/nzh10-skills` 包缓存至远端，严禁人工在包缓存内编辑或提交）；需改全局配置时，直接用一句话说明当前为只读同步节点，引导在主力开发机操作或先克隆仓库运行 `/hub-init <machineId> <hubRepoPath>`。
 3. **严禁绕过隐私与密钥钩子（绝不使用 `--no-verify`）**：公开仓库依靠 `.githooks/pre-commit` 与 `.githooks/pre-push` 结合本地 `.git/info/no-upload-personal` 拦截本机用户名、主机名、家目录路径与密钥。任何时候严禁传 `--no-verify`；钩子拦截时立即停止并如实报告命中项。
 4. **保护云端自动同步路径（Read-Only Paths）**：除非用户点名要求，**绝不修改 `skills/skill-creator/`、`patches/skill-creator.patch`、`scripts/sync-skill-creator.sh`、`upstream.json` 或 `.github/workflows/sync-skill-creator.yml`**。
 
@@ -21,7 +21,7 @@ description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（c
 1. **全局主干 (`<hubRepoPath>/canon/`、`skills/`、`extensions/`)**：
    - `canon/settings.canon.json`：共享手感配置（默认模型、`enabledModels`、`modelThinkingLevels`、TUI 配置）与正式全局 `packages`。
    - `canon/AGENTS.md`：英文 ASD-STE100 全局通用规则（首次接管非空本地 `AGENTS.md` 时，`pi-steward.ts` 自动备份为 `AGENTS.md.bak`）。
-   - `canon/plain-check.toml`：跨平台黑话拦截器默认规则（本机无 `plain-check.toml` 时自动回退并初始化）。
+   - `canon/plain-check.toml`：跨平台黑话拦截器全局规则（启动与 `/reload` 时自动同步至 `<agentDir>/plain-check.toml`，首次接管非空旧文件时自动备份 `.bak`）。
 2. **各机器沉淀池 (`<hubRepoPath>/pools/<machineId>/`)**：
    - `incubating.json`：备份该机可跨机安装的试用包（`npm:`/`git:`）与脱敏备注（严禁写入含真实用户名/家目录的本机绝对路径）。
    - `machine-env.md`：脱敏单机环境模板（严禁含真实用户名、hostname 或个人路径），本机 `APPEND_SYSTEM.md` 为空时用于首次初始化。
@@ -43,7 +43,7 @@ description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（c
 sh <skill-dir>/scripts/steward-preflight.sh
 ```
 
-该脚本确定性完成 4 项前置校验：① `machine.json` 的 `machineId` 与 `hubRepoPath` 存在且不在 `<agentDir>/git` 缓存内；② `core.hooksPath == .githooks` 且 `.git/info/no-upload-personal` 非空；③ 暂存区（staged index）无无关文件；④ 执行 `git pull --ff-only` 同步云端 `skill-creator` 自动更新。
+该脚本纯只读完成 4 项前置校验（绝不自动改写工作树）：① `machine.json` 的 `machineId` 与 `hubRepoPath` 存在且不在 `<agentDir>/git` 缓存内；② `core.hooksPath == .githooks` 且 `.git/info/no-upload-personal` 非空；③ 暂存区（staged index）无无关文件；④ 刷新远端引用并检查 `HEAD...@{upstream}` 是否落后（若落后于远端则报错中止，由人工执行 `git pull --ff-only`）。
 
 ---
 
@@ -56,14 +56,14 @@ sh <skill-dir>/scripts/steward-preflight.sh
    - 先盘点本机多于 `canon` 的插件（区分可跨机 `npm:`/`git:` 与须排除的本机绝对路径），再跑 `sh <skill-dir>/scripts/steward-preflight.sh`（若被脏暂存区拦住，简明点出阻塞暂存文件并附上「可保存 / 已排除」两行清单即可）。
    - 将可跨机插件写入 `pools/<machineId>/incubating.json`；如用户明确点名保存某个试验技能或脱敏环境模板，同步放入 `pools/<machineId>/` 对应路径。
    - 精确暂存并推送（默认仅暂存 `pools/<machineId>/incubating.json` 及用户明确指定的精确文件路径，严禁盲目 `git add .` 或 `--no-verify`）：
-     `/usr/bin/git -C <hubRepoPath> add -- pools/<machineId>/incubating.json && /usr/bin/git -C <hubRepoPath> diff --cached && /usr/bin/git -C <hubRepoPath> commit -m "pool(<machineId>): update incubating state" && /usr/bin/git -C <hubRepoPath> push`
-   - 若存在 `<agentDir>/git/github.com/nzh10/nzh10-skills` 包缓存，顺手运行 `/usr/bin/git -C <agentDir>/git/github.com/nzh10/nzh10-skills pull --ff-only`。
+     `/usr/bin/git -C <hubRepoPath> add -- pools/<machineId>/incubating.json && /usr/bin/git -C <hubRepoPath> diff --cached && /usr/bin/git -C <hubRepoPath> commit -m "chore: update <machineId> incubating pool" && /usr/bin/git -C <hubRepoPath> push`
+   - 推送完成后，下次启动或执行 `/reload` 时 `pi-steward` 会自动将 `<agentDir>/git/github.com/nzh10/nzh10-skills` 包缓存对齐到 `origin/master`。
 3. **晋升到全局主干（Promote to Canon）**：
    - 跑通 `sh <skill-dir>/scripts/steward-preflight.sh`。
    - 插件从 `settings.json`/`incubating.json` 补全 `npm:`/`git:` 前缀写入 `canon/settings.canon.json`（并从 `incubatingPackages` 移除）；规则写入 `canon/AGENTS.md` 并同步 `<agentDir>/AGENTS.md`；Skill/Extension 移入顶层 `skills/` 或 `extensions/`。
-   - 精确 `git add -- <exact-paths>`，核对 `git diff --cached` 零隐私零密钥后 `commit && push`；若存在 `<agentDir>/git/github.com/nzh10/nzh10-skills` 包缓存，顺手 `git pull --ff-only` 并提示 `/reload`。
+   - 精确 `git add -- <exact-paths>`，核对 `git diff --cached` 零隐私零密钥后按 `feat:` / `fix:` / `chore:` 提交并推送；推送后执行 `/reload` 自动对齐 `<agentDir>/git/github.com/nzh10/nzh10-skills` 包缓存并同步 `canon/`（若本次改动了 `extensions/` 或 `skills/` 代码，缓存更新后再执行一次 `/reload` 即可将新代码载入内存）。
 4. **从全局卸载（Demote / Remove）**：
    - 跑通 `sh <skill-dir>/scripts/steward-preflight.sh`。
    - 从 `canon/settings.canon.json`（`packages`、`enabledModels` 或 `modelThinkingLevels`）、本机 `<agentDir>/settings.json` 及 `.pi-steward-state.json` 同步移除目标项。
-   - 仅暂存 `canon/settings.canon.json`，核对 `git diff --cached` 后执行 `git commit -m "canon: remove <item>" && git push`（其他节点下次启动或执行 `/reload` 时按快照自动卸载）。
-5. **跨机器沉淀池调取**：在 `<hubRepoPath>`（只读节点则在 `<agentDir>/git/github.com/nzh10/nzh10-skills` 包缓存）执行 `/usr/bin/git pull --ff-only`，读取 `pools/<other-machineId>/incubating.json` 或 `skills/`，按指示 `pi install <pkg>` 试用或走流程 3 转正。
+   - 仅暂存 `canon/settings.canon.json`，核对 `git diff --cached` 后执行 `git commit -m "chore: remove <item> from canon" && git push`（其他节点下次交互式启动或执行 `/reload` 时按快照自动卸载）。
+5. **跨机器沉淀池调取**：可写节点在 `<hubRepoPath>` 执行 `git pull --ff-only`（或 `git fetch origin`），只读节点（含 Windows PowerShell）直接执行 `/reload` 让 `pi-steward` 将 `<agentDir>/git/github.com/nzh10/nzh10-skills` 对齐远端后，直接读取其中的 `pools/<other-machineId>/incubating.json` 或 `skills/`，按指示 `pi install <pkg>` 试用或走流程 3 转正。

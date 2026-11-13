@@ -1,16 +1,18 @@
-import {
-  getAgentDir as piGetAgentDir,
-  SettingsManager,
-  type ExtensionAPI,
-  type PackageSource,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, PackageSource } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const MODULE_DIR =
+  typeof __dirname !== "undefined" ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+
+function resolveDefaultAgentDir(): string {
+  return process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
+}
 
 export interface CanonSettings {
   defaultProvider?: string;
@@ -131,14 +133,15 @@ export function formatShortPackageName(entry: PackageSource): string {
   return base || shortenHome(raw);
 }
 
-interface HubGitSummary {
+export interface HubGitSummary {
   dirtyCount: number;
   aheadCount: number;
   behindCount: number;
-  cacheBehindHub: boolean;
+  cacheMismatch: boolean;
+  cacheMatchesUpstream?: boolean;
 }
 
-async function inspectHubGitSummary(
+export async function inspectHubGitSummary(
   hubRepoPath: string | undefined,
   packageRepoRoot: string,
 ): Promise<HubGitSummary | undefined> {
@@ -150,7 +153,9 @@ async function inspectHubGitSummary(
   let dirtyCount = 0;
   let aheadCount = 0;
   let behindCount = 0;
-  let cacheBehindHub = false;
+  let cacheMismatch = false;
+  let cacheMatchesUpstream = false;
+  let upstreamHead = "";
 
   try {
     const { stdout } = await execFileAsync(gitBin, ["-C", hubRepoPath, "status", "--porcelain"], {
@@ -166,14 +171,21 @@ async function inspectHubGitSummary(
   }
 
   try {
-    const { stdout } = await execFileAsync(
-      gitBin,
-      ["-C", hubRepoPath, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
-      { timeout: 2000, env: gitEnv },
-    );
-    const parts = stdout.trim().split(/\s+/);
+    const [countsRes, upstreamRes] = await Promise.all([
+      execFileAsync(
+        gitBin,
+        ["-C", hubRepoPath, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+        { timeout: 2000, env: gitEnv },
+      ),
+      execFileAsync(gitBin, ["-C", hubRepoPath, "rev-parse", "--verify", "@{upstream}"], {
+        timeout: 2000,
+        env: gitEnv,
+      }),
+    ]);
+    const parts = countsRes.stdout.trim().split(/\s+/);
     aheadCount = Number(parts[0] ?? 0) || 0;
     behindCount = Number(parts[1] ?? 0) || 0;
+    upstreamHead = upstreamRes.stdout.trim();
   } catch {
     // Upstream branch might not be configured
   }
@@ -189,13 +201,14 @@ async function inspectHubGitSummary(
       ]);
       const hubHead = hubHeadRes.stdout.trim();
       const cacheHead = cacheHeadRes.stdout.trim();
-      cacheBehindHub = Boolean(hubHead && cacheHead && hubHead !== cacheHead);
+      cacheMismatch = Boolean(hubHead && cacheHead && hubHead !== cacheHead);
+      cacheMatchesUpstream = Boolean(upstreamHead && cacheHead && upstreamHead === cacheHead);
     } catch {
       // Ignore cache comparison failure
     }
   }
 
-  return { dirtyCount, aheadCount, behindCount, cacheBehindHub };
+  return { dirtyCount, aheadCount, behindCount, cacheMismatch, cacheMatchesUpstream };
 }
 
 export function formatHubStatusText(
@@ -218,14 +231,16 @@ export function formatHubStatusText(
       actions.push(`有 ${gitSummary.aheadCount} 个提交待 push`);
     }
     if (gitSummary.behindCount > 0) {
-      actions.push(`工作仓落后远端 ${gitSummary.behindCount} 个提交（执行 /reload 拉取）`);
+      actions.push(`工作仓落后远端 ${gitSummary.behindCount} 个提交（请手动 git pull --ff-only）`);
     }
-    if (gitSummary.cacheBehindHub) {
-      actions.push(
-        gitSummary.aheadCount > 0
-          ? "Pi 包缓存待更新（先 push 再执行 /reload）"
-          : "Pi 包缓存落后工作仓（执行 /reload 同步）",
-      );
+    if (gitSummary.cacheMismatch) {
+      if (gitSummary.aheadCount > 0) {
+        actions.push("Pi 包缓存待更新（先 push 再执行 /reload）");
+      } else if (gitSummary.behindCount > 0 && gitSummary.cacheMatchesUpstream) {
+        // Cache is already aligned with upstream while hubRepoPath lags; git pull --ff-only above covers it.
+      } else {
+        actions.push("Pi 包缓存与远端待对齐（执行 /reload 同步）");
+      }
     }
   }
 
@@ -431,7 +446,7 @@ export function readSyncState(agentDir: string, marker?: MachineMarker): Steward
 export function resolveActiveRepoRoot(
   packageRepoRoot: string,
   marker: MachineMarker,
-  agentDir: string = piGetAgentDir(),
+  agentDir: string = resolveDefaultAgentDir(),
 ): {
   mode: "writable-clone" | "read-only-sync";
   activeRepoRoot: string;
@@ -639,14 +654,14 @@ export function computeStewardDiff(packageRepoRoot: string, agentDir: string): S
 
   const fileChanges: ManagedFileDiff[] = [];
   for (const rel of discoverCanonRelativeFiles(canonDir)) {
-    const isAgentsMd = rel === "AGENTS.md";
+    const isCanonManaged = rel === "AGENTS.md" || rel === "plain-check.toml";
     fileChanges.push(
       evaluateManagedFile({
         targetName: rel,
         sourcePath: path.join(canonDir, ...rel.split("/")),
         targetPath: path.join(agentDir, ...rel.split("/")),
-        policy: isAgentsMd ? "overwrite" : "seed-if-missing",
-        backupOnInitialTakeover: isAgentsMd,
+        policy: isCanonManaged ? "overwrite" : "seed-if-missing",
+        backupOnInitialTakeover: isCanonManaged,
       }),
     );
   }
@@ -685,16 +700,24 @@ export function computeStewardDiff(packageRepoRoot: string, agentDir: string): S
 export async function applyStewardDiff(diff: StewardDiff, agentDir: string): Promise<void> {
   if (diff.settingsChanged) {
     const serialized = JSON.stringify(diff.mergedSettings, null, 2) + "\n";
+    let wroteViaLock = false;
     try {
-      const sm = SettingsManager.create(agentDir, agentDir) as unknown as {
-        storage?: { withLock?: (scope: "global", fn: (current?: string) => string | undefined) => void };
-      };
-      if (typeof sm.storage?.withLock === "function") {
+      const mod = (await import("@earendil-works/pi-coding-agent").catch(() => null)) as {
+        SettingsManager?: {
+          create?: (a: string, b: string) => {
+            storage?: { withLock?: (scope: "global", fn: (current?: string) => string | undefined) => void };
+          };
+        };
+      } | null;
+      const sm = mod?.SettingsManager?.create?.(agentDir, agentDir);
+      if (typeof sm?.storage?.withLock === "function") {
         sm.storage.withLock("global", () => serialized);
-      } else {
-        atomicWriteFileSync(path.join(agentDir, "settings.json"), serialized);
+        wroteViaLock = true;
       }
     } catch {
+      wroteViaLock = false;
+    }
+    if (!wroteViaLock) {
       atomicWriteFileSync(path.join(agentDir, "settings.json"), serialized);
     }
   }
@@ -721,24 +744,321 @@ export async function applyStewardDiff(diff: StewardDiff, agentDir: string): Pro
   }
 }
 
-async function pullRepoIfOnline(repoPath: string): Promise<{ ok: boolean; error?: string }> {
+export function tokenizeShellClauses(command: string): string[][] {
+  const clauses: string[][] = [];
+  let currentClause: string[] = [];
+  let currentToken = "";
+  let inToken = false;
+  let quote: "'" | '"' | null = null;
+
+  const pushToken = () => {
+    if (inToken) {
+      currentClause.push(currentToken);
+      currentToken = "";
+      inToken = false;
+    }
+  };
+  const pushClause = () => {
+    pushToken();
+    if (currentClause.length > 0) {
+      clauses.push(currentClause);
+      currentClause = [];
+    }
+  };
+
+  const len = command.length;
+  for (let i = 0; i < len; i += 1) {
+    const ch = command[i]!;
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else currentToken += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = null;
+        continue;
+      }
+      if (ch === "\\" && i + 1 < len) {
+        currentToken += command[i + 1]!;
+        i += 1;
+        continue;
+      }
+      if (ch === "$" && command[i + 1] === "(") {
+        let depth = 1;
+        let j = i + 2;
+        while (j < len && depth > 0) {
+          if (command[j] === "(") depth += 1;
+          else if (command[j] === ")") depth -= 1;
+          j += 1;
+        }
+        const inner = command.slice(i + 2, Math.max(i + 2, j - 1));
+        for (const sub of tokenizeShellClauses(inner)) {
+          if (sub.length > 0) clauses.push(sub);
+        }
+        i = j - 1;
+        continue;
+      }
+      currentToken += ch;
+      continue;
+    }
+
+    if (ch === "#" && !inToken) {
+      while (i < len && command[i] !== "\n") i += 1;
+      pushClause();
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inToken = true;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < len) {
+      currentToken += command[i + 1]!;
+      inToken = true;
+      i += 1;
+      continue;
+    }
+    if (ch === "$" && command[i + 1] === "(") {
+      pushToken();
+      let depth = 1;
+      let j = i + 2;
+      while (j < len && depth > 0) {
+        if (command[j] === "(") depth += 1;
+        else if (command[j] === ")") depth -= 1;
+        j += 1;
+      }
+      const inner = command.slice(i + 2, Math.max(i + 2, j - 1));
+      for (const sub of tokenizeShellClauses(inner)) {
+        if (sub.length > 0) clauses.push(sub);
+      }
+      i = j - 1;
+      continue;
+    }
+    if (ch === ";" || ch === "\n" || ch === "|" || ch === "&" || ch === "(" || ch === ")") {
+      pushClause();
+      continue;
+    }
+    if (ch === " " || ch === "\t" || ch === "\r") {
+      pushToken();
+      continue;
+    }
+    currentToken += ch;
+    inToken = true;
+  }
+  pushClause();
+  return clauses;
+}
+
+const GIT_GLOBAL_VALUE_FLAGS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"]);
+const GIT_SUBCMD_VALUE_FLAGS = new Set([
+  "-m",
+  "--message",
+  "-F",
+  "--file",
+  "--trailer",
+  "-u",
+  "--cleanup",
+  "--author",
+  "--date",
+  "--reuse-message",
+  "-C",
+  "-c",
+]);
+const GIT_HOOK_SUBCOMMANDS = new Set(["commit", "push", "merge", "cherry-pick", "rebase", "am"]);
+
+function inspectGitHookBypass(tokens: string[]): string | undefined {
+  let idx = 0;
+  while (idx < tokens.length) {
+    const t = tokens[idx]!;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) || t === "command" || t === "env" || t === "sudo") {
+      idx += 1;
+      continue;
+    }
+    break;
+  }
+  if (idx >= tokens.length) return undefined;
+  const exe = path.posix.basename(tokens[idx]!.replace(/\\/g, "/")).toLowerCase();
+  if (exe !== "git" && exe !== "git.exe") return undefined;
+  idx += 1;
+
+  let subcommand: string | undefined;
+  while (idx < tokens.length) {
+    const tok = tokens[idx]!;
+    if (GIT_GLOBAL_VALUE_FLAGS.has(tok)) {
+      const val = tokens[idx + 1] ?? "";
+      if (tok === "-c" && /^core\.hooksPath=/i.test(val)) {
+        return "Blocked by pi-steward: overriding core.hooksPath is prohibited by safety rules.";
+      }
+      idx += 2;
+      continue;
+    }
+    if (/^-c\s*core\.hooksPath=/i.test(tok) || /^--config-env=core\.hooksPath/i.test(tok)) {
+      return "Blocked by pi-steward: overriding core.hooksPath is prohibited by safety rules.";
+    }
+    if (tok.startsWith("-")) {
+      idx += 1;
+      continue;
+    }
+    subcommand = tok;
+    idx += 1;
+    break;
+  }
+
+  if (!subcommand || !GIT_HOOK_SUBCOMMANDS.has(subcommand)) return undefined;
+
+  while (idx < tokens.length) {
+    const tok = tokens[idx]!;
+    if (tok === "--") break;
+    if (GIT_SUBCMD_VALUE_FLAGS.has(tok)) {
+      idx += 2;
+      continue;
+    }
+    if (tok === "--no-verify") {
+      return `Blocked by pi-steward: 'git ${subcommand} --no-verify' is prohibited. Fix the underlying Git hook failure instead.`;
+    }
+    if (subcommand === "commit" && /^-[a-zA-Z]*n[a-zA-Z]*$/.test(tok) && !tok.startsWith("--")) {
+      return "Blocked by pi-steward: 'git commit -n' (--no-verify) is prohibited. Fix the underlying Git hook failure instead.";
+    }
+    idx += 1;
+  }
+
+  return undefined;
+}
+
+export function evaluateToolCallGuard(event: {
+  toolName: string;
+  input?: Record<string, unknown>;
+}): { block: true; reason: string } | undefined {
+  if (event.toolName !== "bash" && event.toolName !== "powershell") {
+    return undefined;
+  }
+  const command = typeof event.input?.command === "string" ? event.input.command : "";
+  if (!command.trim()) return undefined;
+  for (const clause of tokenizeShellClauses(command)) {
+    const reason = inspectGitHookBypass(clause);
+    if (reason) return { block: true, reason };
+  }
+  return undefined;
+}
+
+async function resolveUpstreamRef(gitBin: string, repoPath: string, gitEnv: NodeJS.ProcessEnv): Promise<string> {
+  for (const candidate of ["@{upstream}", "origin/HEAD", "origin/master", "origin/main"]) {
+    try {
+      const { stdout } = await execFileAsync(gitBin, ["-C", repoPath, "rev-parse", "--verify", candidate], {
+        timeout: 2000,
+        env: gitEnv,
+      });
+      const sha = stdout.trim();
+      if (sha) return sha;
+    } catch {
+      // Try next candidate
+    }
+  }
+  throw new Error("unable to resolve remote upstream ref");
+}
+
+let criticalCacheChain: Promise<void> = Promise.resolve();
+
+export function runInCacheCriticalSection<T>(fn: () => Promise<T>): Promise<T> {
+  const next = criticalCacheChain.then(fn, fn);
+  criticalCacheChain = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
+export async function syncCacheRepoToUpstream(
+  cacheRepoPath: string,
+  agentDir: string,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; changed?: boolean; shortSha?: string; error?: string }> {
   if (isOfflineModeEnabled()) {
-    return { ok: true };
+    return { ok: true, changed: false };
+  }
+  if (!isInsidePackageCache(cacheRepoPath, agentDir) || !fs.existsSync(path.join(cacheRepoPath, ".git"))) {
+    return { ok: true, changed: false };
+  }
+  const gitBin = getGitExecutable();
+  const gitEnv = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "never",
+  };
+  try {
+    await execFileAsync(gitBin, ["-C", cacheRepoPath, "fetch", "--quiet", "--prune", "origin"], {
+      timeout: 8000,
+      signal,
+      env: gitEnv,
+    });
+  } catch (err) {
+    if (signal?.aborted) {
+      return { ok: true, changed: false };
+    }
+    const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
+    return { ok: false, changed: false, error: msg };
+  }
+  if (signal?.aborted) {
+    return { ok: true, changed: false };
+  }
+
+  return runInCacheCriticalSection(async () => {
+    if (signal?.aborted) {
+      return { ok: true, changed: false };
+    }
+    try {
+      const prevRes = await execFileAsync(gitBin, ["-C", cacheRepoPath, "rev-parse", "HEAD"], {
+        timeout: 2000,
+        env: gitEnv,
+      });
+      const prevHead = prevRes.stdout.trim();
+      const targetSha = await resolveUpstreamRef(gitBin, cacheRepoPath, gitEnv);
+      await execFileAsync(gitBin, ["-C", cacheRepoPath, "reset", "--hard", "--quiet", targetSha], {
+        timeout: 5000,
+        env: gitEnv,
+      });
+      return {
+        ok: true,
+        changed: Boolean(prevHead && prevHead !== targetSha),
+        shortSha: targetSha.slice(0, 7),
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
+      return { ok: false, changed: false, error: msg };
+    }
+  });
+}
+
+async function fetchHubRefsIfOnline(hubRepoPath: string, signal?: AbortSignal): Promise<void> {
+  if (isOfflineModeEnabled() || !fs.existsSync(path.join(hubRepoPath, ".git"))) {
+    return;
   }
   const gitBin = getGitExecutable();
   try {
-    await execFileAsync(gitBin, ["-C", repoPath, "pull", "--ff-only", "--quiet"], {
+    await execFileAsync(gitBin, ["-C", hubRepoPath, "fetch", "--quiet", "origin"], {
       timeout: 8000,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      signal,
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        GCM_INTERACTIVE: "never",
+      },
     });
-    return { ok: true };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
-    return { ok: false, error: msg };
+  } catch {
+    // Non-mutating ref refresh only; never warn on offline/transient network state
   }
 }
 
-function notifyCtx(ctx: { hasUI?: boolean; ui: { notify: (msg: string, level: "info" | "warning" | "error") => void } }, msg: string, level: "info" | "warning" | "error"): void {
+type StewardUIContext = {
+  hasUI?: boolean;
+  ui: {
+    notify: (msg: string, level: "info" | "warning" | "error") => void;
+    setStatus?: (key: string, text: string | undefined) => void;
+  };
+};
+
+function notifyCtx(ctx: StewardUIContext, msg: string, level: "info" | "warning" | "error"): void {
   if (ctx.hasUI) {
     ctx.ui.notify(msg, level);
   } else if (level === "error") {
@@ -748,44 +1068,159 @@ function notifyCtx(ctx: { hasUI?: boolean; ui: { notify: (msg: string, level: "i
   }
 }
 
+function setStewardStatus(ctx: StewardUIContext, text: string | undefined): void {
+  if (ctx.hasUI && typeof ctx.ui.setStatus === "function") {
+    ctx.ui.setStatus("pi-steward", text);
+  }
+}
+
+function findAddedPackageNames(agentDir: string, nextPackages: PackageSource[] | undefined): string[] {
+  if (!Array.isArray(nextPackages) || nextPackages.length === 0) return [];
+  const localSettingsPath = path.join(agentDir, "settings.json");
+  let prevPackages: PackageSource[] = [];
+  if (fs.existsSync(localSettingsPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(localSettingsPath, "utf8")) as CanonSettings;
+      if (Array.isArray(parsed.packages)) {
+        prevPackages = parsed.packages;
+      }
+    } catch {
+      // Ignore malformed local settings here; computeStewardDiff surfaces parse errors
+    }
+  }
+  const prevIds = new Set(prevPackages.map((p) => normalizePackageIdentity(p, agentDir)));
+  return nextPackages
+    .filter((p) => !prevIds.has(normalizePackageIdentity(p, agentDir)))
+    .map((p) => formatShortPackageName(p));
+}
+
 export default function (pi: ExtensionAPI) {
-  const agentDir = piGetAgentDir();
-  const packageRepoRoot = path.resolve(__dirname, "..");
+  const agentDir = resolveDefaultAgentDir();
+  const packageRepoRoot = path.resolve(MODULE_DIR, "..");
+  let activeSyncAbort: AbortController | undefined;
+  let startupSyncTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const cancelBackgroundSync = () => {
+    if (startupSyncTimer) {
+      clearTimeout(startupSyncTimer);
+      startupSyncTimer = undefined;
+    }
+    if (activeSyncAbort) {
+      activeSyncAbort.abort();
+      activeSyncAbort = undefined;
+    }
+  };
+
+  pi.on("tool_call", async (event) => {
+    return evaluateToolCallGuard(event as unknown as { toolName: string; input?: Record<string, unknown> });
+  });
+
+  const reconcileLocalDiff = (ctx: StewardUIContext): Promise<boolean> =>
+    runInCacheCriticalSection(async () => {
+      try {
+        const diff = computeStewardDiff(packageRepoRoot, agentDir);
+        if (diff.hasContentChanges || diff.syncStateChanged) {
+          const addedPkgs = diff.settingsChanged ? findAddedPackageNames(agentDir, diff.mergedSettings.packages) : [];
+          await applyStewardDiff(diff, agentDir);
+          if (diff.hasContentChanges) {
+            const idLabel = diff.machineId ?? "read-only";
+            const pkgHint =
+              addedPkgs.length > 0
+                ? `（新增插件 ${addedPkgs.join(", ")} 将在下次启动或 /reload 时下载安装）`
+                : "";
+            notifyCtx(
+              ctx,
+              `pi-steward 已同步全局配置（${idLabel}）${pkgHint}，执行 /reload 或重启 Pi 生效。`,
+              "info",
+            );
+            return true;
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        notifyCtx(ctx, `pi-steward 同步告警：${msg}`, "warning");
+      }
+      return false;
+    });
+
+  const pullRemoteAndReconcile = async (
+    ctx: StewardUIContext,
+    hubRepoPath: string | undefined,
+    statusText: string,
+    signal: AbortSignal,
+  ) => {
+    setStewardStatus(ctx, statusText);
+    try {
+      const syncCache = !hubRepoPath || safeRealpath(hubRepoPath) !== safeRealpath(packageRepoRoot);
+      const [, cacheRes] = await Promise.all([
+        hubRepoPath ? fetchHubRefsIfOnline(hubRepoPath, signal) : Promise.resolve(),
+        syncCache
+          ? syncCacheRepoToUpstream(packageRepoRoot, agentDir, signal)
+          : Promise.resolve({ ok: true, changed: false, shortSha: undefined, error: undefined }),
+      ]);
+      if (signal.aborted) return;
+      if (!cacheRes.ok && cacheRes.error) {
+        notifyCtx(ctx, `pi-steward 包缓存同步失败：${cacheRes.error}`, "warning");
+      }
+      const notified = await reconcileLocalDiff(ctx);
+      if (cacheRes.changed && !notified) {
+        notifyCtx(
+          ctx,
+          `pi-steward 已同步包缓存至 ${cacheRes.shortSha ?? "最新"}，若包含扩展或技能改动请再执行一次 /reload 加载新代码。`,
+          "info",
+        );
+      }
+    } finally {
+      setStewardStatus(ctx, undefined);
+    }
+  };
+
+  pi.on("session_shutdown", () => {
+    cancelBackgroundSync();
+  });
 
   pi.on("session_start", async (event, ctx) => {
-    const isInitialStart = !event.reason || event.reason === "startup" || event.reason === "reload";
-    const marker = readMachineMarker(agentDir);
-    const { activeRepoRoot, hubRepoPath } = resolveActiveRepoRoot(packageRepoRoot, marker, agentDir);
+    cancelBackgroundSync();
+    await reconcileLocalDiff(ctx);
 
-    if (isInitialStart) {
-      const pullRes = await pullRepoIfOnline(activeRepoRoot);
-      if (!pullRes.ok && pullRes.error) {
-        notifyCtx(ctx, `pi-steward git pull skipped (${path.basename(activeRepoRoot)}): ${pullRes.error}`, "warning");
-      }
-      if (hubRepoPath && safeRealpath(hubRepoPath) !== safeRealpath(packageRepoRoot)) {
-        const cachePullRes = await pullRepoIfOnline(packageRepoRoot);
-        if (!cachePullRes.ok && cachePullRes.error) {
-          notifyCtx(ctx, `pi-steward package cache git pull skipped: ${cachePullRes.error}`, "warning");
-        }
-      }
+    if (!ctx.hasUI || isOfflineModeEnabled()) {
+      return;
     }
 
-    try {
-      const diff = computeStewardDiff(packageRepoRoot, agentDir);
-      if (diff.hasContentChanges || diff.syncStateChanged) {
-        await applyStewardDiff(diff, agentDir);
-        if (diff.hasContentChanges) {
-          const idLabel = diff.machineId ?? "read-only";
-          notifyCtx(
-            ctx,
-            `pi-steward 已同步全局配置（${idLabel}），执行 /reload 或重启 Pi 生效。`,
-            "info",
-          );
+    const marker = readMachineMarker(agentDir);
+    const { hubRepoPath } = resolveActiveRepoRoot(packageRepoRoot, marker, agentDir);
+
+    if (event.reason === "reload") {
+      const controller = new AbortController();
+      activeSyncAbort = controller;
+      try {
+        await pullRemoteAndReconcile(ctx, hubRepoPath, "pi-steward: 正在拉取远端配置…", controller.signal);
+      } finally {
+        if (activeSyncAbort === controller) {
+          activeSyncAbort = undefined;
         }
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      notifyCtx(ctx, `pi-steward 同步告警：${msg}`, "warning");
+      return;
+    }
+
+    if (!event.reason || event.reason === "startup") {
+      const controller = new AbortController();
+      activeSyncAbort = controller;
+      startupSyncTimer = setTimeout(() => {
+        startupSyncTimer = undefined;
+        if (controller.signal.aborted) return;
+        void pullRemoteAndReconcile(
+          ctx,
+          hubRepoPath,
+          "pi-steward: 正在检查远端配置更新…",
+          controller.signal,
+        ).finally(() => {
+          if (activeSyncAbort === controller) {
+            activeSyncAbort = undefined;
+          }
+        });
+      }, 0);
+      startupSyncTimer.unref?.();
     }
   });
 

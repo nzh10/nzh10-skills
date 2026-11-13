@@ -64,22 +64,49 @@ if [ -n "$STAGED" ]; then
   exit 1
 fi
 
-if ! node -e '
+node -e '
   const { execFileSync } = require("node:child_process");
-  execFileSync(process.argv[1], ["-C", process.argv[2], "pull", "--ff-only", "--quiet"], {
-    timeout: 15000,
-    stdio: "inherit",
-    env: {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: "0",
-      GCM_INTERACTIVE: "never",
-      GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND || "ssh -o BatchMode=yes -o ConnectTimeout=10",
-    },
-  });
-' "$GIT_BIN" "$HUB_REPO"; then
-  echo "PREFLIGHT_FAIL[4/4]: git pull --ff-only failed or timed out in ${HUB_REPO}." >&2
-  exit 1
-fi
+  const gitBin = process.argv[1];
+  const repo = process.argv[2];
+  const offline = /^(1|true|yes)$/i.test(process.env.PI_OFFLINE || "");
+  const env = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "never",
+    GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND || "ssh -o BatchMode=yes -o ConnectTimeout=8",
+  };
+  if (!offline) {
+    try {
+      execFileSync(gitBin, ["-C", repo, "fetch", "--quiet", "origin"], {
+        timeout: 10000,
+        stdio: ["ignore", "ignore", "pipe"],
+        env,
+      });
+    } catch {
+      // Offline or transient network issue; still compare against known upstream ref below
+    }
+  }
+  let counts = "";
+  try {
+    counts = execFileSync(gitBin, ["-C", repo, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"], {
+      timeout: 3000,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      env,
+    }).trim();
+  } catch {
+    process.exit(0);
+  }
+  const parts = counts.split(/\s+/);
+  const behind = Number(parts[1] || 0);
+  if (behind > 0) {
+    console.error(
+      `PREFLIGHT_FAIL[4/4]: ${repo} is behind upstream by ${behind} commit(s); run "git -C ${repo} pull --ff-only" first.`,
+    );
+    process.exit(1);
+  }
+' "$GIT_BIN" "$HUB_REPO"
 
 printf 'PREFLIGHT_OK machineId=%s hubRepoPath=%s\n' "$MACHINE_ID" "$HUB_REPO"
 "$GIT_BIN" -C "$HUB_REPO" status --short
+
