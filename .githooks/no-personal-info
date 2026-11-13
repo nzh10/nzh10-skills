@@ -3,8 +3,9 @@
 # noreply identity, or credentials. The denylist is local and must not be committed.
 set -eu
 
+mode=${1:-}
 denylist=$(git rev-parse --git-path info/no-upload-personal)
-if [ ! -s "$denylist" ]; then
+if [ "$mode" != "--portable" ] && [ ! -s "$denylist" ]; then
   echo "refusing: missing $denylist" >&2
   echo "Add one local pattern per line. Do not commit that file." >&2
   exit 1
@@ -17,6 +18,14 @@ secret_re() {
   bearer=$(printf '%s%s' 'Bea' 'rer ')
   printf '%s[A-Z ]*%s|%s[A-Za-z0-9]{20,}|%s[A-Za-z0-9._-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|[A-Za-z0-9_]*(API_KEY|TOKEN|SECRET)[[:space:]]*=[[:space:]]*[^[:space:]$#]{12,}|"(apiKey|api_key|access_token|secret|token)"[[:space:]]*:[[:space:]]*"[^"[:space:]]{16,}"' \
     "$pem_begin" "$pem_end" "$sk" "$bearer"
+}
+
+home_path_re() {
+  h=$(printf '%s%s' 'ho' 'me')
+  u=$(printf '%s%s' 'Use' 'rs')
+  sep='[/\\]+'
+  printf '((^|[^A-Za-z0-9_.-])/(%s|%s)/[A-Za-z0-9._-]+|/mnt/[A-Za-z]/%s/[A-Za-z0-9._-]+|[A-Za-z]:%s%s%s[A-Za-z0-9._-]+)' \
+    "$h" "$u" "$u" "$sep" "$u" "$sep"
 }
 
 bad_name() {
@@ -56,17 +65,39 @@ scan_secrets() {
   return 0
 }
 
+scan_home_paths() {
+  label=$1
+  shift
+  status=0
+  git grep -I -n -E -e "$(home_path_re)" "$@" || status=$?
+  if [ "$status" -eq 0 ]; then
+    echo "refusing: local home path in $label" >&2
+    return 1
+  fi
+  if [ "$status" -gt 1 ]; then
+    echo "refusing: home path scan failed in $label" >&2
+    return 1
+  fi
+  return 0
+}
+
 scan_tree() {
   rev=$1
+  use_denylist=${2:-1}
   if ! git ls-tree -r --name-only "$rev" | scan_names "$rev"; then
     return 1
   fi
   if ! scan_secrets "$rev" "$rev" -- .; then
     return 1
   fi
-  if git grep -I -n -i -F -f "$denylist" "$rev" -- .; then
-    echo "refusing: personal denylist matched $rev" >&2
+  if ! scan_home_paths "$rev" "$rev" -- .; then
     return 1
+  fi
+  if [ "$use_denylist" = "1" ] && [ -s "$denylist" ]; then
+    if git grep -I -n -i -F -f "$denylist" "$rev" -- .; then
+      echo "refusing: personal denylist matched $rev" >&2
+      return 1
+    fi
   fi
   if git grep -I -n -E '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "$rev" -- . \
     | grep -v '@users\.noreply\.github\.com'; then
@@ -83,6 +114,9 @@ scan_index() {
   if ! scan_secrets index --cached -- .; then
     return 1
   fi
+  if ! scan_home_paths index --cached -- .; then
+    return 1
+  fi
   if git grep --cached -I -n -i -F -f "$denylist" -- .; then
     echo "refusing: personal denylist matched the index" >&2
     return 1
@@ -95,13 +129,16 @@ scan_index() {
   return 0
 }
 
-case "${1:-}" in
+case "$mode" in
   --index) scan_index ;;
   --rev)
-    scan_tree "$2"
+    scan_tree "$2" 1
+    ;;
+  --portable)
+    scan_tree "${2:-HEAD}" 0
     ;;
   *)
-    echo "usage: no-personal-info --index | --rev <sha>" >&2
+    echo "usage: no-personal-info --index | --rev <sha> | --portable [sha]" >&2
     exit 2
     ;;
 esac

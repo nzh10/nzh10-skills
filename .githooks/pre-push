@@ -21,3 +21,6 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     "$root/.githooks/no-personal-info" --rev "$rev"
   done
 done
+
+"$root/scripts/check-repo.sh" --fast
+

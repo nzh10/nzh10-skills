@@ -17,17 +17,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Sync from anthropics/skills
         run: ./scripts/sync-skill-creator.sh
-      - name: Commit and push
+      - name: Validate, commit, and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add -- skills/skill-creator upstream.json
           if git diff --cached --quiet; then
             echo "skill-creator already matches upstream"
             exit 0
           fi
+          ./scripts/check-repo.sh --fast
           sha=$(sed -n 's/.*"sha": "\([0-9a-f]*\)".*/\1/p' upstream.json)
-          git commit -m "sync skill-creator from anthropics/skills@${sha}"
+          git commit -m "chore: sync skill-creator from anthropics/skills@${sha}"
+          ./.githooks/no-personal-info --portable HEAD
           git push
+

@@ -293,3 +293,39 @@ test("steward-preflight.sh fails read-only when behind upstream without mutating
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
+
+test("no-personal-info --portable rejects Linux, macOS, WSL, and Windows home paths anywhere in tracked files", () => {
+  const hookScript = path.join(REPO_ROOT, ".githooks", "no-personal-info");
+  const leakedSamples = [
+    ["", "home", "alice", "project"].join("/"),
+    ["", "Users", "bob", ".pi"].join("/"),
+    ["", "mnt", "c", "Users", "charlie", "AppData"].join("/"),
+    ["C:", "Users", "dave", ".pi"].join("/"),
+    JSON.stringify({ dir: ["C:", "Users", "eve", ".pi"].join("\\") }),
+  ];
+
+  for (const sample of leakedSamples) {
+    const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), "portable-hook-"));
+    try {
+      execFileSync("git", ["init", "-q", tmpRepo]);
+      execFileSync("git", ["-C", tmpRepo, "config", "user.name", "Test"]);
+      execFileSync("git", ["-C", tmpRepo, "config", "user.email", "1+test@users.noreply.github.com"]);
+      fs.writeFileSync(path.join(tmpRepo, "notes.md"), `sample: ${sample}\n`, "utf8");
+      execFileSync("git", ["-C", tmpRepo, "add", "notes.md"]);
+      execFileSync("git", ["-C", tmpRepo, "commit", "-q", "-m", "chore: test"]);
+
+      assert.throws(
+        () => {
+          execFileSync("sh", [hookScript, "--portable", "HEAD"], {
+            cwd: tmpRepo,
+            stdio: "pipe",
+          });
+        },
+        /local home path/,
+        `Expected --portable scan to reject sample: ${sample}`,
+      );
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  }
+});
