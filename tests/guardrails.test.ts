@@ -13,10 +13,12 @@ import {
   extractTailSegment,
   loadConfig,
 } from "../extensions/plain-check.ts";
-import {
+import registerPiSteward, {
   computeStewardDiff,
   evaluateToolCallGuard,
   formatHubStatusText,
+  handleStewardTerminalInput,
+  normalizeTerminalInputSequence,
   runInCacheCriticalSection,
   syncCacheRepoToUpstream,
 } from "../extensions/pi-steward.ts";
@@ -327,5 +329,108 @@ test("no-personal-info --portable rejects Linux, macOS, WSL, and Windows home pa
     } finally {
       fs.rmSync(tmpRepo, { recursive: true, force: true });
     }
+  }
+});
+
+test("pi-steward normalizeTerminalInputSequence strips lock bits and folds chord codepoints without altering plain typing or paste", () => {
+  // modifyOtherKeys: CapsLock (64), NumLock (128), uppercase without Shift, and fullwidth chords
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;5;83~"), "\x1b[27;5;115~"); // Ctrl+S (CapsLock uppercase)
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;69;83~"), "\x1b[27;5;115~"); // Ctrl+S + CapsLock bit
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;133;115~"), "\x1b[27;5;115~"); // Ctrl+s + NumLock bit
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;197;83~"), "\x1b[27;5;115~"); // Ctrl+S + CapsLock + NumLock
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;5;65363~"), "\x1b[27;5;115~"); // Ctrl+ｓ (fullwidth lower)
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;69;65331~"), "\x1b[27;5;115~"); // Ctrl+Ｓ (fullwidth upper + CapsLock)
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;5;12288~"), "\x1b[27;5;32~"); // Ctrl+　 (ideographic space)
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;130;13~"), "\x1b[27;2;13~"); // Shift+Enter + NumLock
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;70;80~"), "\x1b[27;6;80~"); // Ctrl+Shift+P + CapsLock preserves Shift
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;129;13~"), "\r"); // Plain Enter with NumLock only
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;129;9~"), "\t"); // Plain Tab with NumLock only
+  assert.equal(normalizeTerminalInputSequence("\x1b[27;65;83~"), "S"); // Plain uppercase 'S' with CapsLock only
+
+  // Kitty CSI-u: CapsLock, NumLock, alternate keys, fullwidth, and repeat/release event suffixes
+  assert.equal(normalizeTerminalInputSequence("\x1b[83;5u"), "\x1b[115;5u");
+  assert.equal(normalizeTerminalInputSequence("\x1b[83;69u"), "\x1b[115;5u");
+  assert.equal(normalizeTerminalInputSequence("\x1b[83;69:3u"), "\x1b[115;5:3u"); // Key release preserved
+  assert.equal(normalizeTerminalInputSequence("\x1b[83;133:2u"), "\x1b[115;5:2u"); // Key repeat preserved
+  assert.equal(normalizeTerminalInputSequence("\x1b[83:83:83;69u"), "\x1b[115:83:115;5u");
+  assert.equal(normalizeTerminalInputSequence("\x1b[1067::83;69u"), "\x1b[1067::115;5u");
+  assert.equal(normalizeTerminalInputSequence("\x1b[65363;5u"), "\x1b[115;5u");
+  assert.equal(normalizeTerminalInputSequence("\x1b[65331;69u"), "\x1b[115;5u");
+  assert.equal(normalizeTerminalInputSequence("\x1b[80;70u"), "\x1b[80;6u"); // Ctrl+Shift+P preserves Shift
+
+  // Unchanged fast-paths: canonical chords, plain CSI-u typing, fullwidth typing, bracketed paste
+  for (const unchanged of [
+    "S",
+    "ｓ",
+    "\x1b[97u",
+    "\x1b[65;2u",
+    "\x1b[115;5u",
+    "\x1b[27;5;115~",
+    "\x1b[200~\x1b[27;69;83~\x1b[201~",
+  ]) {
+    assert.equal(handleStewardTerminalInput(unchanged), undefined, `Expected undefined for: ${JSON.stringify(unchanged)}`);
+  }
+  assert.deepEqual(handleStewardTerminalInput("\x1b[27;69;83~"), { data: "\x1b[27;5;115~" });
+});
+
+test("pi-steward registers onTerminalInput only in tui mode and cleans up on session_shutdown", async () => {
+  const tmpAgent = fs.mkdtempSync(path.join(os.tmpdir(), "steward-tui-"));
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const prevOffline = process.env.PI_OFFLINE;
+  process.env.PI_CODING_AGENT_DIR = tmpAgent;
+  process.env.PI_OFFLINE = "1";
+
+  try {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    const fakePi = {
+      on(event: string, fn: (...args: unknown[]) => unknown) {
+        handlers.set(event, fn);
+      },
+      registerCommand() {},
+    };
+    registerPiSteward(fakePi as unknown as Parameters<typeof registerPiSteward>[0]);
+
+    let registeredListeners = 0;
+    let unsubscribedListeners = 0;
+    let activeHandler: ((data: string) => { data?: string } | undefined) | undefined;
+
+    const tuiCtx = {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        notify() {},
+        setStatus() {},
+        onTerminalInput(fn: (data: string) => { data?: string } | undefined) {
+          registeredListeners += 1;
+          activeHandler = fn;
+          return () => {
+            unsubscribedListeners += 1;
+            if (activeHandler === fn) activeHandler = undefined;
+          };
+        },
+      },
+    };
+
+    const rpcCtx = {
+      ...tuiCtx,
+      mode: "rpc",
+    };
+
+    await handlers.get("session_start")?.({ reason: "startup" }, rpcCtx);
+    assert.equal(registeredListeners, 0);
+
+    await handlers.get("session_start")?.({ reason: "startup" }, tuiCtx);
+    assert.equal(registeredListeners, 1);
+    assert.deepEqual(activeHandler?.("\x1b[83;69u"), { data: "\x1b[115;5u" });
+
+    handlers.get("session_shutdown")?.({ reason: "reload" }, tuiCtx);
+    assert.equal(unsubscribedListeners, 1);
+    assert.equal(activeHandler, undefined);
+  } finally {
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    if (prevOffline === undefined) delete process.env.PI_OFFLINE;
+    else process.env.PI_OFFLINE = prevOffline;
+    fs.rmSync(tmpAgent, { recursive: true, force: true });
   }
 });

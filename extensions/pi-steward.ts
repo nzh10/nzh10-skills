@@ -1094,11 +1094,117 @@ function findAddedPackageNames(agentDir: string, nextPackages: PackageSource[] |
     .map((p) => formatShortPackageName(p));
 }
 
+const TERM_MOD_SHIFT = 1;
+const TERM_MOD_ALT = 2;
+const TERM_MOD_CTRL = 4;
+const TERM_MOD_SUPER = 8;
+const TERM_LOCK_MASK = 64 | 128; // CapsLock (64) + NumLock (128)
+const TERM_CHORD_MASK = TERM_MOD_ALT | TERM_MOD_CTRL | TERM_MOD_SUPER;
+
+const MODIFY_OTHER_KEYS_RE = /^\x1b\[27;(\d+);(\d+)~$/;
+const KITTY_CSI_U_RE = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/;
+
+function normalizeChordCodepoint(codepoint: number, cleanMod: number): number {
+  if ((cleanMod & TERM_CHORD_MASK) === 0) {
+    return codepoint;
+  }
+  let cp = codepoint;
+  if (cp === 0x3000) {
+    cp = 0x20;
+  } else if (cp >= 0xff01 && cp <= 0xff5e) {
+    cp -= 0xfee0;
+  }
+  if ((cleanMod & TERM_MOD_SHIFT) === 0 && cp >= 65 && cp <= 90) {
+    cp += 32;
+  }
+  return cp;
+}
+
+export function normalizeTerminalInputSequence(data: string): string {
+  if (!data.startsWith("\x1b[") || data.startsWith("\x1b[200~")) {
+    return data;
+  }
+
+  const mokMatch = MODIFY_OTHER_KEYS_RE.exec(data);
+  if (mokMatch) {
+    const modValue = Number(mokMatch[1]);
+    const origCp = Number(mokMatch[2]);
+    if (!Number.isSafeInteger(modValue) || modValue < 1 || !Number.isSafeInteger(origCp)) {
+      return data;
+    }
+    const rawMod = modValue - 1;
+    const cleanMod = rawMod & ~TERM_LOCK_MASK;
+    const cp = normalizeChordCodepoint(origCp, cleanMod);
+    if (cleanMod === 0) {
+      if (cp === 13) return "\r";
+      if (cp === 9) return "\t";
+      if (cp >= 32 && cp !== 127 && cp <= 0x10ffff && (cp < 0xd800 || cp > 0xdfff)) {
+        return String.fromCodePoint(cp);
+      }
+    }
+    if (cleanMod === rawMod && cp === origCp) {
+      return data;
+    }
+    return `\x1b[27;${cleanMod + 1};${cp}~`;
+  }
+
+  const kittyMatch = KITTY_CSI_U_RE.exec(data);
+  if (kittyMatch) {
+    const modStr = kittyMatch[4];
+    if (modStr === undefined) {
+      return data;
+    }
+    const origCp = Number(kittyMatch[1]);
+    const modValue = Number(modStr);
+    if (!Number.isSafeInteger(origCp) || !Number.isSafeInteger(modValue) || modValue < 1) {
+      return data;
+    }
+    const rawMod = modValue - 1;
+    const cleanMod = rawMod & ~TERM_LOCK_MASK;
+    const cp = normalizeChordCodepoint(origCp, cleanMod);
+    const shiftedPart = kittyMatch[2];
+    const origBasePart = kittyMatch[3];
+    let nextBasePart = origBasePart;
+    if (origBasePart !== undefined) {
+      const origBaseCp = Number(origBasePart);
+      if (Number.isSafeInteger(origBaseCp)) {
+        nextBasePart = String(normalizeChordCodepoint(origBaseCp, cleanMod));
+      }
+    }
+    if (cleanMod === rawMod && cp === origCp && nextBasePart === origBasePart) {
+      return data;
+    }
+    const altSuffix =
+      nextBasePart !== undefined
+        ? `:${shiftedPart ?? ""}:${nextBasePart}`
+        : shiftedPart !== undefined
+          ? `:${shiftedPart}`
+          : "";
+    const eventSuffix = kittyMatch[5] !== undefined ? `:${kittyMatch[5]}` : "";
+    return `\x1b[${cp}${altSuffix};${cleanMod + 1}${eventSuffix}u`;
+  }
+
+  return data;
+}
+
+export function handleStewardTerminalInput(data: string): { data: string } | undefined {
+  const normalized = normalizeTerminalInputSequence(data);
+  return normalized === data ? undefined : { data: normalized };
+}
+
 export default function (pi: ExtensionAPI) {
   const agentDir = resolveDefaultAgentDir();
   const packageRepoRoot = path.resolve(MODULE_DIR, "..");
   let activeSyncAbort: AbortController | undefined;
   let startupSyncTimer: ReturnType<typeof setTimeout> | undefined;
+  let unsubscribeTerminalInput: (() => void) | undefined;
+
+  const clearTerminalInputNormalizer = () => {
+    if (unsubscribeTerminalInput) {
+      unsubscribeTerminalInput();
+      unsubscribeTerminalInput = undefined;
+    }
+  };
 
   const cancelBackgroundSync = () => {
     if (startupSyncTimer) {
@@ -1176,10 +1282,15 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_shutdown", () => {
+    clearTerminalInputNormalizer();
     cancelBackgroundSync();
   });
 
   pi.on("session_start", async (event, ctx) => {
+    clearTerminalInputNormalizer();
+    if (ctx.mode === "tui" && typeof ctx.ui?.onTerminalInput === "function") {
+      unsubscribeTerminalInput = ctx.ui.onTerminalInput(handleStewardTerminalInput);
+    }
     cancelBackgroundSync();
     await reconcileLocalDiff(ctx);
 
