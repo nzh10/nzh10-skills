@@ -15,10 +15,11 @@ export type Config = {
 	regex_min_sentences: number;
 	keywords: string[];
 	regex: string[];
+	tail_regex?: string[];
 };
 
 export type Hit = {
-	kind: "keyword" | "regex";
+	kind: "keyword" | "regex" | "tail_regex";
 	rule: string;
 	match: string;
 	count: number;
@@ -40,6 +41,7 @@ const DEFAULT_CONFIG: Config = {
 	regex_min_sentences: 2,
 	keywords: [],
 	regex: [],
+	tail_regex: [],
 };
 
 function unescapeTomlBasicString(body: string): string {
@@ -236,6 +238,9 @@ export function loadConfig(explicitPath?: string): { config: Config; configPath:
 	const regex = Array.isArray(data.regex)
 		? data.regex.filter((value: unknown): value is string => typeof value === "string" && value.length > 0)
 		: [];
+	const tailRegex = Array.isArray(data.tail_regex)
+		? data.tail_regex.filter((value: unknown): value is string => typeof value === "string" && value.length > 0)
+		: [];
 	const retries = Number(data.max_retries);
 	const minSentences = Number(data.regex_min_sentences);
 	return {
@@ -247,6 +252,7 @@ export function loadConfig(explicitPath?: string): { config: Config; configPath:
 				Number.isFinite(minSentences) && minSentences >= 1 ? Math.floor(minSentences) : 2,
 			keywords,
 			regex,
+			tail_regex: tailRegex,
 		},
 	};
 }
@@ -261,6 +267,7 @@ export type CompiledRules = {
 	hasAsciiKeyword: boolean;
 	keywordFastRegex: RegExp | null;
 	regexes: CompiledRegex[];
+	tailRegexes: CompiledRegex[];
 	errors: string[];
 };
 
@@ -274,7 +281,9 @@ const RE_FILE_LINK = /\[[^\]]*\]\(file:\/\/[^\s)]+\)/g;
 const RE_HTTP_URL = /https?:\/\/\S+/g;
 const RE_WIN_PATH = /[A-Za-z]:\\[^\s]+/g;
 const RE_MD_TABLE_ROW = /^\|.*\|$/gm;
+const RE_BLOCKQUOTE_LINE = /^\s*>.*$/gm;
 const RE_SENTENCE_SPLIT = /\n\s*\n|[。！？!?]+|\.(?=\s|$)/;
+const RE_SENTENCE_WITH_PUNCT = /[^。！？!?\n]+(?:[。！？!?]+|$)/g;
 const MARKER_PREFIX = "<!-- plain-check:";
 const MAX_NOTICE_CACHE = 64;
 
@@ -308,8 +317,16 @@ export function compileRules(config: Config, precompiledRegexes?: CompiledRegex[
 	const keywordFastRegex =
 		escapedParts.length > 0 ? new RegExp(escapedParts.join("|"), hasAsciiKeyword ? "i" : "") : null;
 
+	const compiledTail = compileRegexes(config.tail_regex ?? []);
 	if (precompiledRegexes) {
-		return { keywords, hasAsciiKeyword, keywordFastRegex, regexes: precompiledRegexes, errors: [] };
+		return {
+			keywords,
+			hasAsciiKeyword,
+			keywordFastRegex,
+			regexes: precompiledRegexes,
+			tailRegexes: compiledTail.regexes,
+			errors: compiledTail.errors,
+		};
 	}
 	const compiled = compileRegexes(config.regex);
 	return {
@@ -317,7 +334,8 @@ export function compileRules(config: Config, precompiledRegexes?: CompiledRegex[
 		hasAsciiKeyword,
 		keywordFastRegex,
 		regexes: compiled.regexes,
-		errors: compiled.errors,
+		tailRegexes: compiledTail.regexes,
+		errors: [...compiled.errors, ...compiledTail.errors],
 	};
 }
 
@@ -346,6 +364,21 @@ export function splitSentences(text: string): string[] {
 		if (trimmed.length > 0) out.push(trimmed);
 	}
 	return out;
+}
+
+export function extractTailSegment(maskedText: string): string {
+	const withoutQuotes = maskedText.includes(">") ? maskedText.replace(RE_BLOCKQUOTE_LINE, "") : maskedText;
+	const paragraphs = withoutQuotes
+		.split(/\n\s*\n+/)
+		.map((p) => p.trim())
+		.filter((p) => p.length > 0);
+	if (paragraphs.length === 0) return "";
+	const lastParagraph = paragraphs[paragraphs.length - 1]!;
+	const chunks = (lastParagraph.match(RE_SENTENCE_WITH_PUNCT) ?? [])
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+	if (chunks.length <= 2) return lastParagraph;
+	return chunks.slice(-2).join(" ");
 }
 
 function isCompiledRules(arg: CompiledRegex[] | CompiledRules | undefined): arg is CompiledRules {
@@ -414,6 +447,24 @@ export function auditText(
 		}
 	}
 
+	if (rules.tailRegexes.length > 0) {
+		const tail = extractTailSegment(masked);
+		if (tail) {
+			for (let t = 0; t < rules.tailRegexes.length; t += 1) {
+				const compiled = rules.tailRegexes[t]!;
+				const matched = compiled.regex.exec(tail);
+				if (matched) {
+					hits.push({
+						kind: "tail_regex",
+						rule: compiled.pattern,
+						match: matched[0] ?? tail,
+						count: 1,
+					});
+				}
+			}
+		}
+	}
+
 	return hits;
 }
 
@@ -439,22 +490,33 @@ export function renderNotice(hits: Hit[], stopped: boolean): string {
 	return lines.join("\n");
 }
 
-export function buildFeedback(hits: Hit[]): string {
+export function buildFeedback(hits: Hit[], originalDraft?: string): string {
 	const rules = hits.map((hit) => {
 		const matched = (hit.match || hit.rule).replace(/\s+/g, " ").trim();
 		const clipped = matched.length > 80 ? `${matched.slice(0, 77)}...` : matched;
 		const count = hit.count > 1 ? `，${hit.count} ${hit.kind === "regex" ? "句" : "次"}` : "";
+		if (hit.kind === "tail_regex") {
+			return `末尾追问/客套规则 ${hit.rule}（匹配：${clipped}）`;
+		}
 		return hit.kind === "regex"
 			? `${hit.rule}（匹配：${clipped}${count}）`
 			: `${hit.rule}${count}`;
 	});
 	const uniqueRules = [...new Set(rules)];
-	return [
+	const hasTailHit = hits.some((h) => h.kind === "tail_regex");
+	const instruction = hasTailHit
+		? "请重写你上一条回复。保留事实、代码、命令和结论；直接删除末尾未授权的追问、菜单式选择题或客套话；不要解释，不要提审查；只输出改写后的回复。"
+		: "请重写你上一条回复。保留事实、代码、命令和结论；不要解释，不要提审查；只输出改写后的回复。";
+	const lines = [
 		"你上一条回复被回滚了，因为命中了黑名单：",
 		...uniqueRules.map((rule) => `- ${rule}`),
 		"",
-		"请重写你上一条回复。保留事实、代码、命令和结论；不要解释，不要提审查；只输出改写后的回复。",
-	].join("\n");
+		instruction,
+	];
+	if (originalDraft && originalDraft.trim().length > 0) {
+		lines.push("", "<previous_draft>", originalDraft, "</previous_draft>");
+	}
+	return lines.join("\n");
 }
 
 function isFinalAssistant(message: any): boolean {
@@ -560,7 +622,7 @@ export default function plainCheck(pi: ExtensionAPI): void {
 				ctx.ui.notify(`plain-check: ${rules.errors.length} 条 regex 无效，已跳过`, "warning");
 			}
 			if (ctx.hasUI) {
-				const count = rules.keywords.length + rules.regexes.length;
+				const count = rules.keywords.length + rules.regexes.length + rules.tailRegexes.length;
 				ctx.ui.setStatus("plain-check", config.enabled ? `plain-check: ${count} 条` : "plain-check: off");
 			}
 		} catch (error) {
@@ -613,7 +675,7 @@ export default function plainCheck(pi: ExtensionAPI): void {
 			pi.sendMessage(
 				{
 					customType: REWRITE_TYPE,
-					content: buildFeedback(hits),
+					content: buildFeedback(hits, tui ? undefined : draft),
 					display: false,
 				},
 				{ deliverAs: "followUp", triggerTurn: true },
@@ -766,7 +828,7 @@ export default function plainCheck(pi: ExtensionAPI): void {
 				if (action === "reload") {
 					applyConfig();
 					notify(
-						`已重载：${rules.keywords.length} keyword，${rules.regexes.length} regex，max_retries=${config.max_retries}`,
+						`已重载：${rules.keywords.length} keyword，${rules.regexes.length} regex，${rules.tailRegexes.length} tail_regex，max_retries=${config.max_retries}`,
 						"info",
 					);
 					if (rules.errors.length > 0) {
@@ -782,7 +844,7 @@ export default function plainCheck(pi: ExtensionAPI): void {
 				}
 
 				notify(
-					`plain-check ${config.enabled ? "on" : "off"}；${rules.keywords.length} keyword，${rules.regexes.length} regex；max_retries=${config.max_retries}；配置：${activeConfigPath}`,
+					`plain-check ${config.enabled ? "on" : "off"}；${rules.keywords.length} keyword，${rules.regexes.length} regex，${rules.tailRegexes.length} tail_regex；max_retries=${config.max_retries}；配置：${activeConfigPath}`,
 					"info",
 				);
 			} catch (error) {
