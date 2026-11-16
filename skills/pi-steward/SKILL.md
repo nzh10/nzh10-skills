@@ -27,7 +27,7 @@ description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（c
    - `machine-env.md`：脱敏单机环境模板（严禁含真实用户名、hostname 或个人路径），本机 `APPEND_SYSTEM.md` 为空时用于首次初始化。
    - `pools/<machineId>/skills/`：该机器正在试验、尚未晋升到顶层 `skills/` 的半成品技能备份。
 3. **本机运行层 (`<agentDir>/`)**：
-   - `settings.json`：由 `pi-steward.ts` 自动合并 `canon/settings.canon.json` 与本机额外试用插件（支持在 `machine.json` 中用 `defaultProvider`/`defaultModel` 覆盖单机默认模型）。
+   - `settings.json`：由 `pi-steward.ts` 自动合并 `canon/settings.canon.json` 与本机额外试用插件（支持在 `machine.json` 中用 `defaultProvider`/`defaultModel` 覆盖单机默认模型）；可写节点自动将 Canon 自包 `git:github.com/nzh10/nzh10-skills` 原位替换为本机 `<hubRepoPath>`，使配置、扩展与技能同源加载，只读节点继续从 `<agentDir>/git/...` 包缓存加载。
    - `.pi-steward-state.json`（同步快照，支持从 `canon` 全局卸载）、`APPEND_SYSTEM.md`（本机环境指令）、`machine.json`（本机身份与 `hubRepoPath` 指针）：**以上三项均严格留在本地，严禁提交进 Git**。
 4. **新机器用户态冷启动 (`<hubRepoPath>/scripts/bootstrap-cli.sh`)**：
    - 空白 WSL / Linux 机器（甚至缺失系统 `python3`、`uv`、`ntn`）无需 `sudo`，先运行 `sh <hubRepoPath>/scripts/bootstrap-cli.sh --check` 检查；只要用户问到「缺的话怎么装 / 如何安装」或确实缺失工具，无论当前检查是否已装齐，都在回复中明确附上一键补装命令 `sh <hubRepoPath>/scripts/bootstrap-cli.sh --install`（在 `~/.local/bin` 安装 `uv`、托管 Python 3.12 与 `ntn`）。
@@ -43,7 +43,7 @@ description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（c
 sh <skill-dir>/scripts/steward-preflight.sh
 ```
 
-该脚本纯只读完成 4 项前置校验（绝不自动改写工作树）：① `machine.json` 的 `machineId` 与 `hubRepoPath` 存在且不在 `<agentDir>/git` 缓存内；② `core.hooksPath == .githooks` 且 `.git/info/no-upload-personal` 非空；③ 暂存区（staged index）无无关文件；④ 刷新远端引用并检查 `HEAD...@{upstream}` 是否落后（若落后于远端则报错中止，由人工执行 `git pull --ff-only`）。
+该脚本纯只读完成 4 项前置校验（绝不自动改写工作树）：① `machine.json` 的 `machineId` 与 `hubRepoPath` 存在且不在 `<agentDir>/git` 缓存内；② `core.hooksPath == .githooks` 且 `.git/info/no-upload-personal` 非空；③ 暂存区（staged index）无无关文件；④ 刷新远端引用并检查 `HEAD...@{upstream}` 是否落后或分叉（纯落后提示 `git pull --ff-only`，已有本地提交且分叉提示 `git pull --rebase`）。
 
 ---
 
@@ -57,11 +57,11 @@ sh <skill-dir>/scripts/steward-preflight.sh
    - 将可跨机插件写入 `pools/<machineId>/incubating.json`；如用户明确点名保存某个试验技能或脱敏环境模板，同步放入 `pools/<machineId>/` 对应路径。
    - 精确暂存并推送（默认仅暂存 `pools/<machineId>/incubating.json` 及用户明确指定的精确文件路径，严禁盲目 `git add .` 或 `--no-verify`）：
      `/usr/bin/git -C <hubRepoPath> add -- pools/<machineId>/incubating.json && /usr/bin/git -C <hubRepoPath> diff --cached && /usr/bin/git -C <hubRepoPath> commit -m "chore: update <machineId> incubating pool" && /usr/bin/git -C <hubRepoPath> push`
-   - 推送完成后，下次启动或执行 `/reload` 时 `pi-steward` 会自动将 `<agentDir>/git/github.com/nzh10/nzh10-skills` 包缓存对齐到 `origin/master`。
+   - 推送完成后，其他只读节点下次启动或执行 `/reload` 时自动将包缓存对齐到 `origin/master`。
 3. **晋升到全局主干（Promote to Canon）**：
    - 跑通 `sh <skill-dir>/scripts/steward-preflight.sh`。
    - 插件从 `settings.json`/`incubating.json` 补全 `npm:`/`git:` 前缀写入 `canon/settings.canon.json`（并从 `incubatingPackages` 移除）；规则写入 `canon/AGENTS.md` 并同步 `<agentDir>/AGENTS.md`；Skill/Extension 移入顶层 `skills/` 或 `extensions/`。
-   - 精确 `git add -- <exact-paths>`，核对 `git diff --cached` 零隐私零密钥后按 `feat:` / `fix:` / `chore:` 提交并推送；推送后执行 `/reload` 自动对齐 `<agentDir>/git/github.com/nzh10/nzh10-skills` 包缓存并同步 `canon/`（若本次改动了 `extensions/` 或 `skills/` 代码，缓存更新后再执行一次 `/reload` 即可将新代码载入内存）。
+   - 本机可写节点直接从 `<hubRepoPath>` 加载扩展与技能，改动后无需 push 即可通过 `/reload` 在本地验证；经用户明确授权后精确 `git add -- <exact-paths>`，核对 `git diff --cached` 零隐私零密钥后按 `feat:` / `fix:` / `chore:` 提交并推送（只读同步节点在 `/reload` 时自动对齐包缓存）。
 4. **从全局卸载（Demote / Remove）**：
    - 跑通 `sh <skill-dir>/scripts/steward-preflight.sh`。
    - 从 `canon/settings.canon.json`（`packages`、`enabledModels` 或 `modelThinkingLevels`）、本机 `<agentDir>/settings.json` 及 `.pi-steward-state.json` 同步移除目标项。

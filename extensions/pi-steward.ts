@@ -43,6 +43,7 @@ export interface StewardSyncState {
   lastSyncedCanonPackages?: string[];
   lastSyncedCanonModels?: string[];
   lastSyncedCanonSettingKeys?: string[];
+  lastSyncedLocalHubPackage?: string;
 }
 
 export type FileSyncPolicy = "overwrite" | "seed-if-missing" | "seed-if-empty";
@@ -73,6 +74,7 @@ export interface StewardDiff {
 }
 
 const SYNC_STATE_FILENAME = ".pi-steward-state.json";
+const CANON_SELF_PACKAGE_ID = "git:github.com/nzh10/nzh10-skills";
 
 export function isOfflineModeEnabled(): boolean {
   const value = process.env.PI_OFFLINE;
@@ -139,6 +141,7 @@ export interface HubGitSummary {
   behindCount: number;
   cacheMismatch: boolean;
   cacheMatchesUpstream?: boolean;
+  runtimeSourceMismatch?: boolean;
 }
 
 export async function inspectHubGitSummary(
@@ -156,6 +159,7 @@ export async function inspectHubGitSummary(
   let cacheMismatch = false;
   let cacheMatchesUpstream = false;
   let upstreamHead = "";
+  const runtimeSourceMismatch = safeRealpath(hubRepoPath) !== safeRealpath(packageRepoRoot);
 
   try {
     const { stdout } = await execFileAsync(gitBin, ["-C", hubRepoPath, "status", "--porcelain"], {
@@ -190,10 +194,7 @@ export async function inspectHubGitSummary(
     // Upstream branch might not be configured
   }
 
-  if (
-    safeRealpath(hubRepoPath) !== safeRealpath(packageRepoRoot) &&
-    fs.existsSync(path.join(packageRepoRoot, ".git"))
-  ) {
+  if (runtimeSourceMismatch && fs.existsSync(path.join(packageRepoRoot, ".git"))) {
     try {
       const [hubHeadRes, cacheHeadRes] = await Promise.all([
         execFileAsync(gitBin, ["-C", hubRepoPath, "rev-parse", "HEAD"], { timeout: 2000, env: gitEnv }),
@@ -208,7 +209,7 @@ export async function inspectHubGitSummary(
     }
   }
 
-  return { dirtyCount, aheadCount, behindCount, cacheMismatch, cacheMatchesUpstream };
+  return { dirtyCount, aheadCount, behindCount, cacheMismatch, cacheMatchesUpstream, runtimeSourceMismatch };
 }
 
 export function formatHubStatusText(
@@ -227,16 +228,21 @@ export function formatHubStatusText(
     if (gitSummary.dirtyCount > 0) {
       actions.push(`工作仓有 ${gitSummary.dirtyCount} 处改动待提交`);
     }
-    if (gitSummary.aheadCount > 0) {
+    if (gitSummary.aheadCount > 0 && gitSummary.behindCount > 0) {
+      actions.push(
+        `工作仓与远端已分叉（领先 ${gitSummary.aheadCount}、落后 ${gitSummary.behindCount} 个提交，请执行 git pull --rebase）`,
+      );
+    } else if (gitSummary.aheadCount > 0) {
       actions.push(`有 ${gitSummary.aheadCount} 个提交待 push`);
-    }
-    if (gitSummary.behindCount > 0) {
+    } else if (gitSummary.behindCount > 0) {
       actions.push(`工作仓落后远端 ${gitSummary.behindCount} 个提交（请手动 git pull --ff-only）`);
     }
-    if (gitSummary.cacheMismatch) {
-      if (gitSummary.aheadCount > 0) {
-        actions.push("Pi 包缓存待更新（先 push 再执行 /reload）");
-      } else if (gitSummary.behindCount > 0 && gitSummary.cacheMatchesUpstream) {
+    if (diff.mode === "writable-clone") {
+      if (gitSummary.runtimeSourceMismatch && !diff.settingsChanged) {
+        actions.push("当前会话扩展仍取自旧路径（执行 /reload 切至本地工作仓）");
+      }
+    } else if (gitSummary.cacheMismatch) {
+      if (gitSummary.behindCount > 0 && gitSummary.cacheMatchesUpstream) {
         // Cache is already aligned with upstream while hubRepoPath lags; git pull --ff-only above covers it.
       } else {
         actions.push("Pi 包缓存与远端待对齐（执行 /reload 同步）");
@@ -615,12 +621,29 @@ export function computeStewardDiff(packageRepoRoot: string, agentDir: string): S
       const prevCanonIdSet = new Set(syncState.lastSyncedCanonPackages ?? []);
       const removedPkgIds = new Set([...prevCanonIdSet].filter((id) => !currentCanonIdSet.has(id)));
 
+      const activeLocalHubSource =
+        mode === "writable-clone" && hubRepoPath ? shortenHome(hubRepoPath) : undefined;
+      const activeLocalHubId =
+        mode === "writable-clone" && hubRepoPath ? normalizePackageIdentity(hubRepoPath, agentDir) : undefined;
+      const prevLocalHubId = syncState.lastSyncedLocalHubPackage;
+      if (prevLocalHubId && prevLocalHubId !== activeLocalHubId) {
+        removedPkgIds.add(prevLocalHubId);
+      }
+
       const rawLocalPkgs = Array.isArray(mergedSettings.packages) ? mergedSettings.packages : [];
       const dedupedPkgs: PackageSource[] = [];
       const seenIds = new Set<string>();
 
       for (const pkg of canonSettings.packages) {
         const id = normalizePackageIdentity(pkg, agentDir);
+        if (activeLocalHubSource && activeLocalHubId && id === CANON_SELF_PACKAGE_ID) {
+          if (!seenIds.has(id) && !seenIds.has(activeLocalHubId)) {
+            seenIds.add(id);
+            seenIds.add(activeLocalHubId);
+            dedupedPkgs.push(activeLocalHubSource);
+          }
+          continue;
+        }
         if (!seenIds.has(id)) {
           seenIds.add(id);
           dedupedPkgs.push(pkg);
@@ -646,8 +669,20 @@ export function computeStewardDiff(packageRepoRoot: string, agentDir: string): S
         syncStateChanged = true;
       }
 
+      if (prevLocalHubId !== activeLocalHubId) {
+        if (activeLocalHubId) {
+          nextSyncState.lastSyncedLocalHubPackage = activeLocalHubId;
+        } else {
+          delete nextSyncState.lastSyncedLocalHubPackage;
+        }
+        syncStateChanged = true;
+      }
+
       incubatingPackages = dedupedPkgs
-        .filter((p) => !currentCanonIdSet.has(normalizePackageIdentity(p, agentDir)))
+        .filter((p) => {
+          const id = normalizePackageIdentity(p, agentDir);
+          return !currentCanonIdSet.has(id) && id !== activeLocalHubId;
+        })
         .map((p) => (typeof p === "string" ? p : p.source));
     }
   }
@@ -1074,7 +1109,12 @@ function setStewardStatus(ctx: StewardUIContext, text: string | undefined): void
   }
 }
 
-function findAddedPackageNames(agentDir: string, nextPackages: PackageSource[] | undefined): string[] {
+function findAddedPackageNames(
+  agentDir: string,
+  nextPackages: PackageSource[] | undefined,
+  activeLocalHubId?: string,
+  prevLocalHubId?: string,
+): string[] {
   if (!Array.isArray(nextPackages) || nextPackages.length === 0) return [];
   const localSettingsPath = path.join(agentDir, "settings.json");
   let prevPackages: PackageSource[] = [];
@@ -1089,6 +1129,12 @@ function findAddedPackageNames(agentDir: string, nextPackages: PackageSource[] |
     }
   }
   const prevIds = new Set(prevPackages.map((p) => normalizePackageIdentity(p, agentDir)));
+  if (activeLocalHubId && prevIds.has(CANON_SELF_PACKAGE_ID)) {
+    prevIds.add(activeLocalHubId);
+  }
+  if (prevLocalHubId && prevIds.has(prevLocalHubId)) {
+    prevIds.add(CANON_SELF_PACKAGE_ID);
+  }
   return nextPackages
     .filter((p) => !prevIds.has(normalizePackageIdentity(p, agentDir)))
     .map((p) => formatShortPackageName(p));
@@ -1224,9 +1270,17 @@ export default function (pi: ExtensionAPI) {
   const reconcileLocalDiff = (ctx: StewardUIContext): Promise<boolean> =>
     runInCacheCriticalSection(async () => {
       try {
+        const prevLocalHubId = readSyncState(agentDir).lastSyncedLocalHubPackage;
         const diff = computeStewardDiff(packageRepoRoot, agentDir);
         if (diff.hasContentChanges || diff.syncStateChanged) {
-          const addedPkgs = diff.settingsChanged ? findAddedPackageNames(agentDir, diff.mergedSettings.packages) : [];
+          const addedPkgs = diff.settingsChanged
+            ? findAddedPackageNames(
+                agentDir,
+                diff.mergedSettings.packages,
+                diff.nextSyncState.lastSyncedLocalHubPackage,
+                prevLocalHubId,
+              )
+            : [];
           await applyStewardDiff(diff, agentDir);
           if (diff.hasContentChanges) {
             const idLabel = diff.machineId ?? "read-only";
@@ -1257,7 +1311,7 @@ export default function (pi: ExtensionAPI) {
   ) => {
     setStewardStatus(ctx, statusText);
     try {
-      const syncCache = !hubRepoPath || safeRealpath(hubRepoPath) !== safeRealpath(packageRepoRoot);
+      const syncCache = !hubRepoPath;
       const [, cacheRes] = await Promise.all([
         hubRepoPath ? fetchHubRefsIfOnline(hubRepoPath, signal) : Promise.resolve(),
         syncCache
@@ -1381,6 +1435,7 @@ export default function (pi: ExtensionAPI) {
         const gitBin = getGitExecutable();
         try {
           await execFileAsync(gitBin, ["-C", candidate, "config", "core.hooksPath", ".githooks"]);
+          await execFileAsync(gitBin, ["-C", candidate, "config", "branch.master.rebase", "true"]);
           const { stdout } = await execFileAsync(gitBin, ["-C", candidate, "rev-parse", "--git-path", "info/no-upload-personal"]);
           const denylistPath = path.resolve(candidate, stdout.trim());
           if (!fs.existsSync(denylistPath) || fs.readFileSync(denylistPath, "utf8").trim() === "") {

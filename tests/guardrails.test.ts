@@ -15,6 +15,7 @@ import registerPlainCheck, {
   splitTypedSentences,
 } from "../extensions/plain-check.ts";
 import registerPiSteward, {
+  applyStewardDiff,
   computeStewardDiff,
   evaluateToolCallGuard,
   formatHubStatusText,
@@ -441,7 +442,7 @@ test("pi-steward syncCacheRepoToUpstream resets package cache to rewritten origi
   }
 });
 
-test("pi-steward serializes cache critical section and reports accurate /hub-status direction when hub lags upstream", async () => {
+test("pi-steward serializes cache critical section and reports accurate /hub-status direction when hub lags or diverges", async () => {
   const order: string[] = [];
   const first = runInCacheCriticalSection(async () => {
     order.push("reset-start");
@@ -464,10 +465,110 @@ test("pi-steward serializes cache critical section and reports accurate /hub-sta
       cacheMismatch: true,
       cacheMatchesUpstream: true,
     });
-    assert.match(laggingHubStatus.text, /工作仓落后远端 2 个提交/);
+    assert.match(laggingHubStatus.text, /工作仓落后远端 2 个提交（请手动 git pull --ff-only）/);
     assert.doesNotMatch(laggingHubStatus.text, /包缓存/);
+
+    const divergedStatus = formatHubStatusText(diff, tmpAgent, {
+      dirtyCount: 0,
+      aheadCount: 2,
+      behindCount: 1,
+      cacheMismatch: false,
+    });
+    assert.match(divergedStatus.text, /已分叉.*领先 2、落后 1.*git pull --rebase/);
+    assert.doesNotMatch(divergedStatus.text, /--ff-only/);
   } finally {
     fs.rmSync(tmpAgent, { recursive: true, force: true });
+  }
+});
+
+test("pi-steward maps self-package to hubRepoPath in-place on writable clones, configures branch.master.rebase, and restores git source on read-only nodes", async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "steward-single-source-"));
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  try {
+    const hubRepo = path.join(tmpRoot, "hub");
+    const cacheRepo = path.join(tmpRoot, "cache");
+    const agentDir = path.join(tmpRoot, "agent");
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    for (const dir of [hubRepo, cacheRepo]) {
+      execFileSync("git", ["init", "-q", dir]);
+      fs.mkdirSync(path.join(dir, "canon"), { recursive: true });
+      fs.copyFileSync(path.join(REPO_ROOT, "canon", "settings.canon.json"), path.join(dir, "canon", "settings.canon.json"));
+      fs.copyFileSync(path.join(REPO_ROOT, "canon", "AGENTS.md"), path.join(dir, "canon", "AGENTS.md"));
+      fs.copyFileSync(path.join(REPO_ROOT, "canon", "plain-check.toml"), path.join(dir, "canon", "plain-check.toml"));
+    }
+
+    // Seed pre-existing local settings with remote self-package + extra local incubating package
+    const extraLocalPkg = path.join(tmpRoot, "my-local-ext");
+    fs.mkdirSync(extraLocalPkg, { recursive: true });
+    fs.writeFileSync(
+      path.join(agentDir, "settings.json"),
+      JSON.stringify(
+        {
+          packages: ["git:github.com/nzh10/nzh10-skills", "npm:pi-subagents", extraLocalPkg],
+        },
+        null,
+        2,
+      ) + "\n",
+      "utf8",
+    );
+
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
+    const fakePi = {
+      on() {},
+      registerCommand(name: string, spec: { handler: (args: string, ctx: any) => Promise<void> }) {
+        commands.set(name, spec.handler);
+      },
+    };
+    registerPiSteward(fakePi as unknown as Parameters<typeof registerPiSteward>[0]);
+
+    await commands.get("hub-init")?.(`dev-box ${hubRepo}`, {
+      hasUI: true,
+      ui: { notify() {} },
+    });
+
+    // 1. /hub-init enables both core.hooksPath=.githooks and branch.master.rebase=true
+    assert.equal(execFileSync("git", ["-C", hubRepo, "config", "--get", "core.hooksPath"], { encoding: "utf8" }).trim(), ".githooks");
+    assert.equal(execFileSync("git", ["-C", hubRepo, "config", "--get", "branch.master.rebase"], { encoding: "utf8" }).trim(), "true");
+
+    // 2. settings.json replaces git:github.com/nzh10/nzh10-skills in-place with hubRepo (no duplicate, not in incubating)
+    const syncedSettings = JSON.parse(fs.readFileSync(path.join(agentDir, "settings.json"), "utf8"));
+    assert.equal(syncedSettings.packages[0], hubRepo);
+    assert.ok(!syncedSettings.packages.includes("git:github.com/nzh10/nzh10-skills"));
+    assert.ok(syncedSettings.packages.includes(extraLocalPkg));
+
+    // 3. Second computeStewardDiff is idempotent and excludes hubRepo from incubatingPackages
+    const secondDiff = computeStewardDiff(hubRepo, agentDir);
+    assert.equal(secondDiff.mode, "writable-clone");
+    assert.equal(secondDiff.settingsChanged, false);
+    assert.deepEqual(secondDiff.incubatingPackages, [extraLocalPkg]);
+
+    // Writable /hub-status ahead of upstream never asks to push before /reload
+    const aheadStatus = formatHubStatusText(secondDiff, agentDir, {
+      dirtyCount: 0,
+      aheadCount: 2,
+      behindCount: 0,
+      cacheMismatch: false,
+      runtimeSourceMismatch: false,
+    });
+    assert.match(aheadStatus.text, /有 2 个提交待 push/);
+    assert.doesNotMatch(aheadStatus.text, /先 push 再执行 \/reload/);
+
+    // 4. Demoting to read-only node removes stale local hubRepo path and restores git:github.com/nzh10/nzh10-skills
+    fs.unlinkSync(path.join(agentDir, "machine.json"));
+    const roDiff = computeStewardDiff(cacheRepo, agentDir);
+    assert.equal(roDiff.mode, "read-only-sync");
+    assert.equal(roDiff.settingsChanged, true);
+    await applyStewardDiff(roDiff, agentDir);
+    const roSettings = JSON.parse(fs.readFileSync(path.join(agentDir, "settings.json"), "utf8"));
+    assert.equal(roSettings.packages[0], "git:github.com/nzh10/nzh10-skills");
+    assert.ok(!roSettings.packages.includes(hubRepo));
+    assert.ok(roSettings.packages.includes(extraLocalPkg));
+  } finally {
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
@@ -506,7 +607,7 @@ test("skill-creator run_eval.py parses triggered event even when pi exits immedi
   }
 });
 
-test("steward-preflight.sh fails read-only when behind upstream without mutating dirty worktree", () => {
+test("steward-preflight.sh fails read-only with --ff-only when behind and --rebase when diverged without mutating dirty worktree", () => {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "preflight-test-"));
   try {
     const bareOrigin = path.join(tmpRoot, "origin.git");
@@ -526,6 +627,8 @@ test("steward-preflight.sh fails read-only when behind upstream without mutating
     execFileSync("git", ["-C", peerRepo, "push", "-q", "-u", "origin", "HEAD"]);
 
     execFileSync("git", ["clone", "-q", bareOrigin, hubRepo]);
+    execFileSync("git", ["-C", hubRepo, "config", "user.name", "Test"]);
+    execFileSync("git", ["-C", hubRepo, "config", "user.email", "1+test@users.noreply.github.com"]);
     execFileSync("git", ["-C", hubRepo, "config", "core.hooksPath", ".githooks"]);
     fs.mkdirSync(path.join(hubRepo, ".git", "info"), { recursive: true });
     fs.writeFileSync(path.join(hubRepo, ".git", "info", "no-upload-personal"), "secret-token\n", "utf8");
@@ -535,7 +638,7 @@ test("steward-preflight.sh fails read-only when behind upstream without mutating
       "utf8",
     );
 
-    // Advance origin via peerRepo while hubRepo has an unstaged edit
+    // 1. Pure behind: suggests pull --ff-only and leaves dirty worktree untouched
     fs.writeFileSync(path.join(peerRepo, "canon", "AGENTS.md"), "# updated upstream\n", "utf8");
     execFileSync("git", ["-C", peerRepo, "commit", "-q", "-am", "chore: upstream update"]);
     execFileSync("git", ["-C", peerRepo, "push", "-q", "origin", "HEAD"]);
@@ -548,9 +651,22 @@ test("steward-preflight.sh fails read-only when behind upstream without mutating
         env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
         stdio: "pipe",
       });
-    }, /behind upstream/);
+    }, /behind upstream.*pull --ff-only/);
 
-    // Verify worktree file was NOT touched or overwritten
+    assert.equal(fs.readFileSync(path.join(hubRepo, "canon", "AGENTS.md"), "utf8"), "# local dirty edit\n");
+
+    // 2. Diverged (ahead + behind): suggests pull --rebase while remaining read-only
+    fs.writeFileSync(path.join(hubRepo, "local-note.txt"), "local commit\n", "utf8");
+    execFileSync("git", ["-C", hubRepo, "add", "--", "local-note.txt"]);
+    execFileSync("git", ["-C", hubRepo, "commit", "-q", "-m", "feat: local commit on master"]);
+
+    assert.throws(() => {
+      execFileSync("sh", [preflightScript], {
+        env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
+        stdio: "pipe",
+      });
+    }, /diverged from upstream \(1 ahead, 1 behind\).*pull --rebase/);
+
     assert.equal(fs.readFileSync(path.join(hubRepo, "canon", "AGENTS.md"), "utf8"), "# local dirty edit\n");
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });

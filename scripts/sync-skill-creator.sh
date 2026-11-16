@@ -31,6 +31,11 @@ rm -rf "$dest"
 mkdir -p "$root/skills"
 cp -a "$tmp/tree/skills/skill-creator" "$dest"
 
+if [ -d "$root/.git" ] && [ -f "$meta" ] && [ -z "$(git -C "$root" status --porcelain -- skills/skill-creator)" ]; then
+  echo "skill-creator unchanged ($sha)"
+  exit 0
+fi
+
 cat > "$meta" <<EOF
 {
   "repo": "https://github.com/anthropics/skills",

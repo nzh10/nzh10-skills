@@ -98,11 +98,18 @@ node -e '
     process.exit(0);
   }
   const parts = counts.split(/\s+/);
+  const ahead = Number(parts[0] || 0);
   const behind = Number(parts[1] || 0);
   if (behind > 0) {
-    console.error(
-      `PREFLIGHT_FAIL[4/4]: ${repo} is behind upstream by ${behind} commit(s); run "git -C ${repo} pull --ff-only" first.`,
-    );
+    if (ahead > 0) {
+      console.error(
+        `PREFLIGHT_FAIL[4/4]: ${repo} has diverged from upstream (${ahead} ahead, ${behind} behind); run "git -C ${repo} pull --rebase" first.`,
+      );
+    } else {
+      console.error(
+        `PREFLIGHT_FAIL[4/4]: ${repo} is behind upstream by ${behind} commit(s); run "git -C ${repo} pull --ff-only" first.`,
+      );
+    }
     process.exit(1);
   }
 ' "$GIT_BIN" "$HUB_REPO"
