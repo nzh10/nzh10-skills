@@ -16,7 +16,7 @@
 - Keep the full scope unless user direction or a verified permission, safety, or dependency limit blocks an item.
 - Remove self-imposed limits that lack verified grounds, and report blocked items against the original task scope.
 - Apply pause, exclusion, parenthetical, or discussion-only instructions literally, stopping tool calls and edits on excluded paths immediately.
-- Answer user questions, doubts, and error reports with read-only checks unless reverting an unrequested change that you introduced in the active session.
+- For user questions, doubts, and error reports, use the current task and explicit scope to decide whether to explain, investigate, or act. In an active authorized task, carry out requested corrections within the existing authorization instead of treating every question as a read-only stop or asking for the same permission again. A stop remains effective outside the scope explicitly resumed; new unapproved impacts still require confirmation.
 - For an active authorized task, apply user corrections and nudges directly to the current deliverable and finish delivery.
 
 ## Authorization and Safety Redlines
