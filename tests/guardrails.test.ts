@@ -811,3 +811,44 @@ test("pi-steward registers onTerminalInput only in tui mode and cleans up on ses
     fs.rmSync(tmpAgent, { recursive: true, force: true });
   }
 });
+
+test("Pi/Node pre-commit checks validate staged syntax, settings and extension entry points", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-check-test-"));
+  const script = path.join(REPO_ROOT, "scripts", "check-pi-node.mjs");
+  const git = (...args: string[]) => execFileSync("git", ["-C", tmp, ...args], { stdio: "pipe" });
+  const check = () => execFileSync(process.execPath, [script, tmp, "--index"], { encoding: "utf8", stdio: "pipe" });
+  try {
+    git("init", "-q");
+    for (const file of ["canon/settings.canon.json", "canon/plain-check.toml", "extensions/plain-check.ts", "extensions/wsl-links.ts", "extensions/pi-steward.ts"]) {
+      const dest = path.join(tmp, file);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(path.join(REPO_ROOT, file), dest);
+    }
+    git("add", "--", "canon", "extensions");
+    assert.match(check(), /Pi\/Node checks passed \(index\)/);
+
+    const syntax = path.join(tmp, "syntax.ts");
+    fs.writeFileSync(syntax, 'import type { Missing } from "fixture";\nconst broken: number = ;\n');
+    git("add", "--", "syntax.ts");
+    fs.writeFileSync(syntax, 'const fixed: number = 1;\n');
+    assert.throws(check, /syntax\.ts|Unexpected token/);
+    git("add", "--", "syntax.ts");
+
+    const settings = path.join(tmp, "canon/settings.canon.json");
+    fs.writeFileSync(settings, '{"enabledModels":42}\n');
+    git("add", "--", "canon/settings.canon.json");
+    fs.copyFileSync(path.join(REPO_ROOT, "canon/settings.canon.json"), settings);
+    assert.throws(check, /Pi enabledModels must be a string array/);
+    git("add", "--", "canon/settings.canon.json");
+
+    const entry = path.join(tmp, "extensions/wsl-links.ts");
+    fs.writeFileSync(entry, 'export default 42;\n');
+    git("add", "--", "extensions/wsl-links.ts");
+    fs.copyFileSync(path.join(REPO_ROOT, "extensions/wsl-links.ts"), entry);
+    assert.throws(check, /requires a default registration function/);
+    git("add", "--", "extensions/wsl-links.ts");
+    assert.match(check(), /Pi\/Node checks passed \(index\)/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

@@ -1,4 +1,5 @@
 #!/bin/sh
 set -eu
 root=$(git rev-parse --show-toplevel)
-exec "$root/.githooks/no-personal-info" --index
+"$root/.githooks/no-personal-info" --index
+exec node "$root/scripts/check-pi-node.mjs" "$root" --index

@@ -22,17 +22,13 @@ if [ -f "$root/patches/skill-creator.patch" ] && [ -d "$root/skills/skill-creato
   fi
 fi
 
-# 3. TypeScript syntax check across all extensions (including extensions importing host-injected packages)
-for ts_file in "$root/extensions/"*.ts; do
-  [ -f "$ts_file" ] || continue
-  node --check "$ts_file"
-done
+# 3. Pi configuration/entry points and Node syntax, with explicit TypeScript stripping.
+node "$root/scripts/check-pi-node.mjs" "$root"
 
-# 4. Single Node pass: JSON schemas, pools privacy/source invariants, plain-check.toml compilation, extension imports
+# 4. Repository JSON and pools privacy/source invariants.
 node --input-type=module - "$root" <<'NODE'
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
 
 const root = process.argv[2];
 const HOME_PATH_RE =
@@ -46,7 +42,6 @@ function readJson(relPath) {
 if (fs.existsSync(path.join(root, "package.json"))) {
   readJson("package.json");
 }
-readJson("canon/settings.canon.json");
 if (fs.existsSync(path.join(root, "upstream.json"))) {
   readJson("upstream.json");
 }
@@ -86,15 +81,6 @@ if (fs.existsSync(poolsDir)) {
   }
 }
 
-const plainMod = await import(pathToFileURL(path.join(root, "extensions", "plain-check.ts")).href);
-const loaded = plainMod.loadConfig(path.join(root, "canon", "plain-check.toml"));
-const compiled = plainMod.compileRules(loaded.config);
-if (compiled.errors.length > 0) {
-  throw new Error(`Invalid regex in canon/plain-check.toml: ${compiled.errors.join("; ")}`);
-}
-
-await import(pathToFileURL(path.join(root, "extensions", "wsl-links.ts")).href);
-await import(pathToFileURL(path.join(root, "extensions", "pi-steward.ts")).href);
 NODE
 
 # 5. Python AST syntax and intra-skill static import verification

@@ -17,6 +17,7 @@
 
 ## Git Commit and Release Rules
 
+- Use the existing pre-commit hook to catch invalid submitted files before they enter history. It checks index content for privacy, Pi settings structure, extension default registration functions, plain-check rules, and Node JS/TS syntax. TypeScript is stripped with Node's built-in parser before JavaScript syntax checking; staged extension inputs use a small temporary directory for the existing import checks.
 - Run `scripts/check-repo.sh` and `node --test tests/guardrails.test.ts` before committing changes to extensions, canon rules, or hooks.
 - Stage explicit file paths (`git add -- <paths>`) and review `git diff --cached` before each commit.
 - Use unscoped Conventional Commit subjects (`feat: ...`, `fix: ...`, `chore: ...`) in imperative mood.
