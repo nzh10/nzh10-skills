@@ -5,10 +5,14 @@
     "xai/grok-4.7",
     "kimi-coding/k3.1-pro-highspeed",
     "antigravity-acp/gemini-4-carbon",
-    "antigravity-acp/gemini-3.8-flash",
+    "antigravity-acp/gemini-4-neon",
     "deepseek/deepseek-flash",
     "kimi-coding/k3.1-pro",
-    "antigravity-acp/gemini-4-argon"
+    "antigravity-acp/gemini-4-hydrogen",
+    "openai-codex/gpt-6.2-astra",
+    "openai-codex/gpt-6.2-sol",
+    "openai-codex/gpt-6-luna",
+    "openai-codex/gpt-6.1-terra"
   ],
   "packages": [
     "git:github.com/nzh10/nzh10-skills",
