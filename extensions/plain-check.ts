@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,10 +35,9 @@ export type Hit = {
 const MODULE_DIR =
 	typeof __dirname !== "undefined" ? __dirname : path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_CANON_CONFIG_PATH = path.resolve(MODULE_DIR, "..", "canon", "plain-check.toml");
-const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
-const LOCAL_CONFIG_PATH = path.join(AGENT_DIR, "plain-check.toml");
-const LOG_PATH = path.join(AGENT_DIR, "plain-check.log.jsonl");
-const MARKER_RETRY = "<!-- plain-check:retry -->\n";
+const agentPath = (name: string) => path.join(
+	process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent"), name,
+);
 const MARKER_STOP = "<!-- plain-check:stop -->\n";
 const REWRITE_TYPE = "plain-check-rewrite";
 
@@ -231,9 +231,10 @@ export function parsePlainCheckToml(source: string): Record<string, unknown> {
 }
 
 export function resolveConfigPath(): string {
-	if (fs.existsSync(LOCAL_CONFIG_PATH)) return LOCAL_CONFIG_PATH;
+	const localPath = agentPath("plain-check.toml");
+	if (fs.existsSync(localPath)) return localPath;
 	if (fs.existsSync(PACKAGE_CANON_CONFIG_PATH)) return PACKAGE_CANON_CONFIG_PATH;
-	return LOCAL_CONFIG_PATH;
+	return localPath;
 }
 
 export function loadConfig(explicitPath?: string): { config: Config; configPath: string } {
@@ -317,7 +318,8 @@ const RE_INTRA_LINE_SENTENCE_SPLIT = /[。！？!?]+|(?<!^(?:\d+\.)*\d+)\.(?=\s|
 const RE_SENTENCE_WITH_PUNCT = /[^。！？!?\n]+(?:[。！？!?]+|$)/g;
 const RE_LEADING_NEG_DELIM = /^[，,；;：:、\s]+/;
 const MARKER_PREFIX = "<!-- plain-check:";
-const MAX_NOTICE_CACHE = 64;
+const RETRY_MARKER_RE = /<!-- plain-check:retry(?::([\w-]+))? -->\n?/;
+const ALL_MARKERS_RE = /<!-- plain-check:(?:retry(?::[\w-]+)?|stop) -->\n?/g;
 
 export function compileRegexes(
 	patterns: string[],
@@ -628,7 +630,7 @@ export function auditText(
 
 export function stripMarkers(text: string): string {
 	if (!text.includes(MARKER_PREFIX)) return text;
-	return text.replaceAll(MARKER_RETRY, "").replaceAll(MARKER_STOP, "");
+	return text.replace(ALL_MARKERS_RE, "");
 }
 
 function formatHitSummary(hits: Hit[]): string {
@@ -737,24 +739,44 @@ function textOf(message: any): string {
 	return parts.join("\n");
 }
 
-function hasRetryMarker(message: any): boolean {
-	if (message?.role !== "assistant" || !Array.isArray(message.content)) return false;
-	for (let i = 0; i < message.content.length; i += 1) {
-		const block = message.content[i];
-		if (block?.type === "text" && typeof block.text === "string" && block.text.includes(MARKER_RETRY)) {
-			return true;
-		}
-	}
-	return false;
+function retryKey(message: any, entryId?: string): string | undefined {
+	if (message?.role !== "assistant") return undefined;
+	const match = RETRY_MARKER_RE.exec(textOf(message));
+	return match ? match[1] ?? (entryId ? `entry:${entryId}` : undefined) : undefined;
 }
 
-function isSupersededByLaterAssistant(messages: any[], index: number): boolean {
-	for (let k = index + 1; k < messages.length; k += 1) {
-		const role = messages[k]?.role;
-		if (role === "user") return false;
-		if (role === "assistant") return true;
+// Only a complete response to our feedback replaces a draft. Tool calls,
+// errors, truncated output, and replies to a later user prompt do not.
+export function supersededRetries(messages: any[]): Set<number> {
+	const superseded = new Set<number>();
+	let draft = -1;
+	let feedbackSeen = false;
+	for (let i = 0; i < messages.length; i += 1) {
+		const message = messages[i];
+		if (message?.role === "user") {
+			draft = -1;
+			feedbackSeen = false;
+		} else if (message?.role === "custom" && message.customType === REWRITE_TYPE && draft >= 0) {
+			const key = message.details?.retryKey;
+			feedbackSeen = !key || key === retryKey(messages[draft]);
+		} else if (isFinalAssistant(message)) {
+			if (draft >= 0 && feedbackSeen) superseded.add(draft);
+			draft = RETRY_MARKER_RE.test(textOf(message)) ? i : -1;
+			feedbackSeen = false;
+		}
 	}
-	return false;
+	return superseded;
+}
+
+export function hiddenRetryKeys(entries: any[]): Set<string> {
+	const messages = entries.map((entry) => entry.type === "message" ? entry.message
+		: entry.type === "custom_message" ? { ...entry, role: "custom" } : undefined);
+	const hidden = new Set<string>();
+	for (const index of supersededRetries(messages)) {
+		const key = retryKey(messages[index], entries[index].id);
+		if (key) hidden.add(key);
+	}
+	return hidden;
 }
 
 function markMessage(message: any, marker: string): any {
@@ -775,6 +797,8 @@ export function rollbackMessage(
 	stopped: boolean,
 	tui: boolean,
 ): any {
+	// TUI retains the full message as its durable recovery copy. Only the
+	// display projection changes; thinking and tool progress stay untouched.
 	if (tui) return markMessage(message, marker);
 	if (stopped) {
 		const body = stripMarkers(textOf(message));
@@ -797,21 +821,13 @@ function logAudit(message: any, hits: Hit[], action: "retry" | "stopped"): void 
 			...(hit.budget !== undefined ? { budget: hit.budget } : {}),
 		})),
 	})}\n`;
-	void fs.promises.appendFile(LOG_PATH, line, "utf8").catch(() => {
+	void fs.promises.appendFile(agentPath("plain-check.log.jsonl"), line, "utf8").catch(() => {
 		// Logging must not break the reply.
 	});
 }
 
 function setStatus(ctx: any, text: string | undefined): void {
 	if (ctx?.hasUI) ctx.ui.setStatus("plain-check", text);
-}
-
-function cacheNotice(cache: Map<string, string>, key: string, value: string): void {
-	if (cache.size >= MAX_NOTICE_CACHE && !cache.has(key)) {
-		const oldest = cache.keys().next().value;
-		if (oldest !== undefined) cache.delete(oldest);
-	}
-	cache.set(key, value);
 }
 
 function totalRuleCount(rules: CompiledRules): number {
@@ -830,25 +846,53 @@ function isSubagentChild(): boolean {
 
 export default function plainCheck(pi: ExtensionAPI): void {
 	let config: Config = { ...DEFAULT_CONFIG };
-	let activeConfigPath = LOCAL_CONFIG_PATH;
+	let activeConfigPath = agentPath("plain-check.toml");
 	let rules: CompiledRules = compileRules(DEFAULT_CONFIG);
-	const noticeCache = new Map<string, string>();
+	let hiddenRetries = new Set<string>();
 	let attempts = 0;
-	let pendingRewrite = false;
+	let pendingRewrite: { key: string; hits: Hit[] } | undefined;
+	let refresh = () => {};
+
+	const redraw = () => {
+		try { refresh(); } catch {
+			// A UI failure must leave the last complete reply recoverable.
+			if (pendingRewrite) hiddenRetries.delete(pendingRewrite.key);
+			pendingRewrite = undefined;
+		}
+	};
+	const restorePending = () => {
+		if (!pendingRewrite) return;
+		hiddenRetries.delete(pendingRewrite.key);
+		pendingRewrite = undefined;
+		redraw();
+	};
+	const rebuildDisplay = (ctx: any) => {
+		const next = hiddenRetryKeys(ctx.sessionManager?.getBranch?.() ?? []);
+		if (pendingRewrite) next.add(pendingRewrite.key);
+		const changed = next.size !== hiddenRetries.size || [...next].some((key) => !hiddenRetries.has(key));
+		hiddenRetries = next;
+		if (changed) redraw();
+	};
 
 	const applyConfig = () => {
 		const loaded = loadConfig();
 		config = loaded.config;
 		activeConfigPath = loaded.configPath;
 		rules = compileRules(loaded.config);
-		noticeCache.clear();
 		attempts = 0;
-		pendingRewrite = false;
+		restorePending();
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		try {
 			applyConfig();
+			rebuildDisplay(ctx);
+			if (ctx.mode === "tui") {
+				ctx.ui.setWidget("plain-check-refresh", (tui) => {
+					refresh = () => { tui.invalidate(); tui.requestRender(true); };
+					return { render: () => [], invalidate: () => {} };
+				});
+			}
 			if (ctx.hasUI && rules.errors.length > 0) {
 				ctx.ui.notify(`plain-check: ${rules.errors.length} 条 regex 无效，已跳过`, "warning");
 			}
@@ -861,29 +905,48 @@ export default function plainCheck(pi: ExtensionAPI): void {
 		} catch (error) {
 			config = { ...DEFAULT_CONFIG, enabled: false };
 			rules = compileRules(config);
-			noticeCache.clear();
+			restorePending();
 			if (ctx.hasUI) {
 				ctx.ui.notify(`plain-check: ${error instanceof Error ? error.message : String(error)}`, "error");
 			}
 		}
 	});
 
+	pi.on("session_tree", (_event, ctx) => {
+		restorePending();
+		attempts = 0;
+		rebuildDisplay(ctx);
+	});
+	pi.on("session_shutdown", (_event, ctx) => {
+		restorePending();
+		if (ctx.mode === "tui") ctx.ui.setWidget("plain-check-refresh", undefined);
+		refresh = () => {};
+	});
 	pi.on("input", (event) => {
-		if ((event as any).source !== "extension") {
+		if (event.source !== "extension") {
 			attempts = 0;
-			pendingRewrite = false;
+			restorePending();
 		}
 	});
 
 	pi.on("message_end", async (event, ctx) => {
-		if (!config.enabled || isSubagentChild()) return;
 		const message = event.message as any;
+		if (message?.role === "user") {
+			attempts = 0;
+			restorePending();
+		}
+		if (!config.enabled || isSubagentChild()) return;
 		if (!isFinalAssistant(message)) return;
+		// Keep earlier attempts withdrawn; this complete message is now the
+		// recovery copy, even if it reaches the retry limit or fails audit again.
+		if (pendingRewrite) {
+			pendingRewrite = undefined;
+			redraw();
+		}
 		const draft = textOf(message);
 		if (!draft.trim()) return;
 		const hits = auditText(draft, config, rules);
 		if (hits.length === 0) {
-			pendingRewrite = false;
 			setStatus(ctx, undefined);
 			return;
 		}
@@ -897,57 +960,50 @@ export default function plainCheck(pi: ExtensionAPI): void {
 		const canRetry = attempts < effectiveMaxRetries;
 		if (!canRetry) {
 			logAudit(message, hits, "stopped");
-			pendingRewrite = false;
 			setStatus(ctx, `plain-check: 命中 ${hits.length} 项，保留原回复`);
-			const rolled = rollbackMessage(message, MARKER_STOP, hits, true, tui);
-			if (tui) {
-				cacheNotice(noticeCache, textOf(rolled), renderStoppedReply(hits, cleanDraft));
-			}
-			return { message: rolled };
+			return { message: rollbackMessage(message, MARKER_STOP, hits, true, tui) };
 		}
 
-		attempts += 1;
-		logAudit(message, hits, "retry");
-		setStatus(ctx, `plain-check: 命中 ${hits.length} 项，重写中 (${attempts}/${effectiveMaxRetries})`);
+		const key = randomUUID();
 		try {
 			pi.sendMessage(
 				{
 					customType: REWRITE_TYPE,
 					content: buildFeedback(hits, tui ? undefined : cleanDraft),
 					display: false,
+					details: { retryKey: key },
 				},
 				{ deliverAs: "followUp", triggerTurn: true },
 			);
-			pendingRewrite = true;
 		} catch {
-			pendingRewrite = false;
-			const rolled = rollbackMessage(message, MARKER_STOP, hits, true, tui);
-			if (tui) {
-				cacheNotice(noticeCache, textOf(rolled), renderStoppedReply(hits, cleanDraft));
-			}
-			return { message: rolled };
+			setStatus(ctx, "plain-check: 改写提交失败，保留原回复");
+			return undefined;
 		}
-		const rolled = rollbackMessage(message, MARKER_RETRY, hits, false, tui);
-		if (tui) {
-			cacheNotice(noticeCache, textOf(rolled), cleanDraft);
-		}
+		attempts += 1;
+		logAudit(message, hits, "retry");
+		pendingRewrite = { key, hits };
+		hiddenRetries.add(key);
+		setStatus(ctx, `plain-check: 命中 ${hits.length} 项，重写中 (${attempts}/${effectiveMaxRetries})`);
+		const rolled = rollbackMessage(message, `<!-- plain-check:retry:${key} -->\n`, hits, false, tui);
+		redraw();
 		return { message: rolled };
 	});
 
-	(pi as any).registerMarkdownTransformer((markdown: string, context: any) => {
-		if (context?.messageType !== "assistant" || !markdown.startsWith(MARKER_PREFIX)) return markdown;
-		const marker = markdown.startsWith(MARKER_STOP)
-			? MARKER_STOP
-			: markdown.startsWith(MARKER_RETRY)
-				? MARKER_RETRY
-				: null;
-		if (!marker) return markdown;
-		const cached = noticeCache.get(markdown);
-		if (cached !== undefined) return cached;
+	pi.registerMarkdownTransformer((markdown, context) => {
+		if (context.messageType !== "assistant" || !markdown.includes(MARKER_PREFIX)) return markdown;
+		const match = RETRY_MARKER_RE.exec(markdown);
+		const key = match ? match[1] ?? (context.messageId ? `entry:${context.messageId}` : undefined) : undefined;
+		if (key && hiddenRetries.has(key)) {
+			return pendingRewrite?.key === key ? renderNotice(pendingRewrite.hits, false) : "";
+		}
 		const text = stripMarkers(markdown);
-		const rendered = marker === MARKER_STOP ? renderStoppedReply(auditText(text, config, rules), text) : text;
-		cacheNotice(noticeCache, markdown, rendered);
-		return rendered;
+		return markdown.includes(MARKER_STOP.trim()) ? renderStoppedReply(auditText(text, config, rules), text) : text;
+	});
+
+	// The finalized message is persisted before turn_end, so reload and live
+	// rendering use the same branch-relative replacement rules.
+	pi.on("turn_end", (event, ctx) => {
+		if (isFinalAssistant(event.message)) rebuildDisplay(ctx);
 	});
 
 	pi.on("context", async (event) => {
@@ -978,6 +1034,7 @@ export default function plainCheck(pi: ExtensionAPI): void {
 			return undefined;
 		}
 
+		const superseded = supersededRetries(rawMessages);
 		const out: any[] = [];
 		for (let i = 0; i < rawMessages.length; i += 1) {
 			const msg = rawMessages[i];
@@ -986,7 +1043,7 @@ export default function plainCheck(pi: ExtensionAPI): void {
 				continue;
 			}
 			if (hasMarkedAssistant && msg?.role === "assistant" && Array.isArray(msg.content)) {
-				if (hasRetryMarker(msg) && isSupersededByLaterAssistant(rawMessages, i)) {
+				if (superseded.has(i)) {
 					continue;
 				}
 				let blockChanged = false;
@@ -1007,9 +1064,10 @@ export default function plainCheck(pi: ExtensionAPI): void {
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		if (pendingRewrite) {
-			pendingRewrite = false;
-			setStatus(ctx, "plain-check: 重写未完成");
+			restorePending();
+			setStatus(ctx, "plain-check: 重写未完成，已恢复原回复");
 		}
+		rebuildDisplay(ctx);
 	});
 
 	pi.registerCommand("plain", {
@@ -1080,6 +1138,7 @@ export default function plainCheck(pi: ExtensionAPI): void {
 
 				if (action === "on" || action === "off") {
 					config = { ...config, enabled: action === "on" };
+					if (!config.enabled) restorePending();
 					setStatus(ctx, config.enabled ? undefined : "plain-check: off");
 					notify(`plain-check ${config.enabled ? "on" : "off"}`, "info");
 					return;

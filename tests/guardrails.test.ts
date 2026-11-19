@@ -185,7 +185,7 @@ test("plain-check deduplicates overlapping spans, exempts lexicalized words and 
   assert.ok(paddedHits.some((h) => h.kind === "negation" && h.budget === 1 && h.count === 2));
 });
 
-test("plain-check runtime bypasses only PI_SUBAGENT_CHILD, preserves top-level headless <previous_draft>, keeps TUI retry draft visible, and prunes superseded drafts", async () => {
+test("plain-check runtime bypasses only PI_SUBAGENT_CHILD, preserves headless feedback, withdraws TUI retry drafts, and retains the last reply at the limit", async () => {
   const tmpAgent = fs.mkdtempSync(path.join(os.tmpdir(), "plain-runtime-"));
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
   const prevSubagentChild = process.env.PI_SUBAGENT_CHILD;
@@ -219,6 +219,9 @@ test("plain-check runtime bypasses only PI_SUBAGENT_CHILD, preserves top-level h
       hasUI: true,
       ui: {
         notify() {},
+        setWidget(_key: string, factory: any) {
+          factory?.({ invalidate() {}, requestRender() {} });
+        },
         setStatus(_key: string, text: string | undefined) {
           statusValue = text;
         },
@@ -258,7 +261,7 @@ test("plain-check runtime bypasses only PI_SUBAGENT_CHILD, preserves top-level h
     );
     assert.equal(sentMessages.length, 1);
     assert.match(sentMessages[0].content, /<previous_draft>[\s\S]*abc1234[\s\S]*<\/previous_draft>/);
-    assert.match(rpcRes.message.content[0].text, /^<!-- plain-check:retry -->/);
+    assert.match(rpcRes.message.content[0].text, /^<!-- plain-check:retry:[\w-]+ -->/);
     assert.doesNotMatch(rpcRes.message.content[0].text, /abc1234/);
 
     // Reset turn state via new user input
@@ -279,7 +282,7 @@ test("plain-check runtime bypasses only PI_SUBAGENT_CHILD, preserves top-level h
     assert.equal(cleanRes, undefined);
     assert.equal(statusValue, undefined);
 
-    // 4. Negation-only hit in TUI retries once (1/1), keeps draft visible during retry, and preserves stopped draft on second hit
+    // 4. Negation-only hit in TUI retries once (1/1), withdraws the draft, and preserves the last draft at the limit
     const retryRes = await handlers.get("message_end")?.(
       {
         message: {
@@ -294,8 +297,10 @@ test("plain-check runtime bypasses only PI_SUBAGENT_CHILD, preserves top-level h
     assert.doesNotMatch(sentMessages[0].content, /<previous_draft>/);
     assert.match(statusValue ?? "", /\(1\/1\)/);
     const retryMarkedText = retryRes.message.content[0].text;
-    assert.match(retryMarkedText, /^<!-- plain-check:retry -->/);
-    assert.equal(transformer!(retryMarkedText, { messageType: "assistant" }), "第一版草稿：未提交、未推送。");
+    assert.match(retryMarkedText, /^<!-- plain-check:retry:[\w-]+ -->/);
+    const pendingDisplay = transformer!(retryMarkedText, { messageType: "assistant" });
+    assert.match(pendingDisplay, /正在原位改写/);
+    assert.doesNotMatch(pendingDisplay, /第一版草稿/);
 
     // During pendingRewrite, context keeps attempt 1 + feedback
     const ctxDuringRetry = await handlers.get("context")?.({
@@ -326,6 +331,7 @@ test("plain-check runtime bypasses only PI_SUBAGENT_CHILD, preserves top-level h
     const renderedStop = transformer!(stopMarkedText, { messageType: "assistant" });
     assert.match(renderedStop, /原回复保留/);
     assert.match(renderedStop, /第二版正文结论：配置没动。缓存没有清。/);
+    assert.equal(transformer!(retryMarkedText, { messageType: "assistant" }), "");
 
     // Context hook prunes superseded attempt 1 and feedback, leaving clean [user, attempt 2]
     const ctxAfterStop = await handlers.get("context")?.({
