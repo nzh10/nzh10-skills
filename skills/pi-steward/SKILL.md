@@ -27,8 +27,8 @@ description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（c
    - `machine-env.md`：脱敏单机环境模板（严禁含真实用户名、hostname 或个人路径），本机 `APPEND_SYSTEM.md` 为空时用于首次初始化。
    - `pools/<machineId>/skills/`：该机器正在试验、尚未晋升到顶层 `skills/` 的半成品技能备份。
 3. **本机运行层 (`<agentDir>/`)**：
-   - `settings.json`：由 `pi-steward.ts` 自动合并 `canon/settings.canon.json` 与本机额外试用插件（支持在 `machine.json` 中用 `defaultProvider`/`defaultModel` 覆盖单机默认模型）；可写节点自动将 Canon 自包 `git:github.com/nzh10/nzh10-skills` 原位替换为本机 `<hubRepoPath>`，使配置、扩展与技能同源加载，只读节点继续从 `<agentDir>/git/...` 包缓存加载。
-   - `.pi-steward-state.json`（同步快照，支持从 `canon` 全局卸载）、`APPEND_SYSTEM.md`（本机环境指令）、`machine.json`（本机身份与 `hubRepoPath` 指针）：**以上三项均严格留在本地，严禁提交进 Git**。
+   - `settings.json`：由 `pi-steward.ts` 自动合并 `canon/settings.canon.json` 与本机额外试用插件（支持在 `machine.json` 中用 `defaultProvider`/`defaultModel` 覆盖单机默认模型）；可写节点自动将 Canon 自包 `git:github.com/nzh10/nzh10-skills` 原位替换为本机 `<hubRepoPath>`，使配置、扩展与技能同源加载，只读节点继续从 `<agentDir>/git/...` 包缓存加载。`enabledModels` 仅在 TUI 模式下按本机已配置认证的厂商以 `seenVisibleCanon` 基线做增量同步，本机 `/scoped-models` 增删改排严格留在本地；补登缺登 Canon 厂商后执行 `/reload` 写盘再 `/new`（或重启 Pi）生效。
+   - `.pi-steward-state.json`（同步快照，含 `seenVisibleCanon` 与 `loginGuideShown`，支持从 `canon` 全局卸载）、`APPEND_SYSTEM.md`（本机环境指令）、`machine.json`（本机身份与 `hubRepoPath` 指针）：**以上三项均严格留在本地，严禁提交进 Git**。
 4. **新机器用户态冷启动 (`<hubRepoPath>/scripts/bootstrap-cli.sh`)**：
    - 空白 WSL / Linux 机器（甚至缺失系统 `python3`、`uv`、`ntn`）无需 `sudo`，先运行 `sh <hubRepoPath>/scripts/bootstrap-cli.sh --check` 检查；只要用户问到「缺的话怎么装 / 如何安装」或确实缺失工具，无论当前检查是否已装齐，都在回复中明确附上一键补装命令 `sh <hubRepoPath>/scripts/bootstrap-cli.sh --install`（在 `~/.local/bin` 安装 `uv`、托管 Python 3.12 与 `ntn`）。
 
@@ -61,9 +61,13 @@ sh <skill-dir>/scripts/steward-preflight.sh
 3. **晋升到全局主干（Promote to Canon）**：
    - 跑通 `sh <skill-dir>/scripts/steward-preflight.sh`。
    - 插件从 `settings.json`/`incubating.json` 补全 `npm:`/`git:` 前缀写入 `canon/settings.canon.json`（并从 `incubatingPackages` 移除）；规则写入 `canon/AGENTS.md` 并同步 `<agentDir>/AGENTS.md`；Skill/Extension 移入顶层 `skills/` 或 `extensions/`。
+   - 模型（`enabledModels`）晋升必须以最新 `canon/settings.canon.json` 为底稿，调用 `<hubRepoPath>/extensions/pi-steward.ts` 导出的 `mergeCanonModelsForPromote` 并传入实时厂商认证判定（与运行时 `getProvider` + `getProviderAuthStatus` 一致）：
+     - `explicit` 模式（任意本地状态可用）：仅增删用户点名且本机已配置认证的厂商模型；
+     - `align-providers` 模式（仅本地 `enabledModels` 为非空数组时可用，拒绝 `[]` 与缺键）：仅按显式指定的已配置 `targetProviders` 原槽位对齐（溢出项紧跟该厂商末槽，无原槽则追加），本机未登录或未点名厂商的 Canon 条目原位原序零改动。
    - 本机可写节点直接从 `<hubRepoPath>` 加载扩展与技能，改动后无需 push 即可通过 `/reload` 在本地验证；经用户明确授权后精确 `git add -- <exact-paths>`，核对 `git diff --cached` 零隐私零密钥后按 `feat:` / `fix:` / `chore:` 提交并推送（只读同步节点在 `/reload` 时自动对齐包缓存）。
 4. **从全局卸载（Demote / Remove）**：
    - 跑通 `sh <skill-dir>/scripts/steward-preflight.sh`。
-   - 从 `canon/settings.canon.json`（`packages`、`enabledModels` 或 `modelThinkingLevels`）、本机 `<agentDir>/settings.json` 及 `.pi-steward-state.json` 同步移除目标项。
+   - **插件或通用键卸载**：从 `canon/settings.canon.json`（`packages` 或 `modelThinkingLevels`）、本机 `<agentDir>/settings.json` 及 `.pi-steward-state.json` 同步移除目标项。
+   - **模型（`enabledModels`）卸载**：仅对最新 `canon/settings.canon.json` 调用 `mergeCanonModelsForPromote({ mode: "explicit", remove: [...] })` 显式删除已配置厂商模型，**不手改 `.pi-steward-state.json`**；本机与其他节点下次 TUI 启动或 `/reload` 时按 `seenVisibleCanon` 自动清理，再 `/new`（或重启 Pi）生效。
    - 仅暂存 `canon/settings.canon.json`，核对 `git diff --cached` 后执行 `git commit -m "chore: remove <item> from canon" && git push`（其他节点下次交互式启动或执行 `/reload` 时按快照自动卸载）。
 5. **跨机器沉淀池调取**：可写节点在 `<hubRepoPath>` 执行 `git pull --ff-only`（或 `git fetch origin`），只读节点（含 Windows PowerShell）直接执行 `/reload` 让 `pi-steward` 将 `<agentDir>/git/github.com/nzh10/nzh10-skills` 对齐远端后，直接读取其中的 `pools/<other-machineId>/incubating.json` 或 `skills/`，按指示 `pi install <pkg>` 试用或走流程 3 转正。

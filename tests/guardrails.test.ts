@@ -17,10 +17,13 @@ import registerPlainCheck, {
 import registerPiSteward, {
   applyStewardDiff,
   computeStewardDiff,
+  createProviderVisibilityProbe,
   evaluateToolCallGuard,
   formatHubStatusText,
   handleStewardTerminalInput,
+  mergeCanonModelsForPromote,
   normalizeTerminalInputSequence,
+  readSyncState,
   runInCacheCriticalSection,
   syncCacheRepoToUpstream,
 } from "../extensions/pi-steward.ts";
@@ -856,5 +859,568 @@ test("Pi/Node pre-commit checks validate staged syntax, settings and extension e
     assert.match(check(), /Pi\/Node checks passed \(index\)/);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+function createModelSyncFixture(canonModels: string[]) {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "steward-models-"));
+  const repoDir = path.join(tmpRoot, "repo");
+  const agentDir = path.join(tmpRoot, "agent");
+  fs.mkdirSync(path.join(repoDir, "canon"), { recursive: true });
+  fs.mkdirSync(agentDir, { recursive: true });
+  const writeCanon = (models: string[]) => {
+    fs.writeFileSync(
+      path.join(repoDir, "canon", "settings.canon.json"),
+      JSON.stringify({ enabledModels: models }, null, 2) + "\n",
+      "utf8",
+    );
+  };
+  writeCanon(canonModels);
+  return { tmpRoot, repoDir, agentDir, writeCanon };
+}
+
+function makeFakeRegistry(registered: Record<string, boolean>) {
+  return {
+    getProvider(provider: string) {
+      return Object.prototype.hasOwnProperty.call(registered, provider) ? { id: provider } : undefined;
+    },
+    getProviderAuthStatus(provider: string) {
+      return { configured: Boolean(registered[provider]) };
+    },
+  };
+}
+
+test("pi-steward enabledModels sync handles 0-provider fresh takeover, Option A first login, Ctrl+X, Ctrl+A, and local delete/reorder without churn", async () => {
+  const fixture = createModelSyncFixture([
+    "xai/grok-4.7",
+    "kimi-coding/k3.1-pro",
+    "antigravity-acp/gemini-4-carbon",
+    "antigravity-acp/gemini-3.8-flash",
+  ]);
+  try {
+    // 1. Fresh machine with 0 configured providers -> writes enabledModels: [] and seenVisibleCanon: []
+    const zeroReg = makeFakeRegistry({ xai: false, "kimi-coding": false, "antigravity-acp": false });
+    const d1 = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: zeroReg, syncModels: true });
+    assert.equal(d1.settingsChanged, true);
+    assert.equal(d1.enabledModelsChanged, true);
+    assert.deepEqual(d1.mergedSettings.enabledModels, []);
+    assert.deepEqual(d1.nextSyncState.seenVisibleCanon, []);
+    assert.deepEqual(d1.missingAuthProviders, ["xai", "kimi-coding", "antigravity-acp"]);
+    await applyStewardDiff(d1, fixture.agentDir);
+
+    // Repeat sync with 0 providers -> idempotent (0 churn)
+    const d1Repeat = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: zeroReg, syncModels: true });
+    assert.equal(d1Repeat.settingsChanged, false);
+    assert.equal(d1Repeat.syncStateChanged, false);
+
+    // 2. Option A: first login to antigravity-acp while local is [] -> imports its Canon models
+    const acpOnlyReg = makeFakeRegistry({ xai: false, "kimi-coding": false, "antigravity-acp": true });
+    const d2 = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: acpOnlyReg, syncModels: true });
+    assert.equal(d2.enabledModelsChanged, true);
+    assert.deepEqual(d2.mergedSettings.enabledModels, [
+      "antigravity-acp/gemini-4-carbon",
+      "antigravity-acp/gemini-3.8-flash",
+    ]);
+    assert.deepEqual(d2.nextSyncState.seenVisibleCanon, [
+      "antigravity-acp/gemini-4-carbon",
+      "antigravity-acp/gemini-3.8-flash",
+    ]);
+    await applyStewardDiff(d2, fixture.agentDir);
+
+    // 3. Local /scoped-models delete, reorder, and custom model addition remain untouched on repeat sync
+    const settingsPath = path.join(fixture.agentDir, "settings.json");
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify({ enabledModels: ["custom/local-only", "antigravity-acp/gemini-3.8-flash"] }, null, 2) + "\n",
+      "utf8",
+    );
+    const d3 = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: acpOnlyReg, syncModels: true });
+    assert.equal(d3.settingsChanged, false);
+    assert.equal(d3.syncStateChanged, false);
+
+    // 4. Ctrl+X (enabledModels: []): new Canon model for configured provider -> [M]; unconfigured provider -> stays []
+    fs.writeFileSync(settingsPath, JSON.stringify({ enabledModels: [] }, null, 2) + "\n", "utf8");
+    const d4Stable = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: acpOnlyReg, syncModels: true });
+    assert.equal(d4Stable.settingsChanged, false);
+
+    // Add unconfigured provider model -> stays []
+    fixture.writeCanon([
+      "xai/grok-4.7",
+      "xai/grok-5",
+      "kimi-coding/k3.1-pro",
+      "antigravity-acp/gemini-4-carbon",
+      "antigravity-acp/gemini-3.8-flash",
+    ]);
+    const d4Unconf = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: acpOnlyReg, syncModels: true });
+    assert.equal(d4Unconf.settingsChanged, false);
+    assert.deepEqual(d4Unconf.mergedSettings.enabledModels, []);
+
+    // Add configured provider model -> becomes [M]
+    fixture.writeCanon([
+      "xai/grok-4.7",
+      "xai/grok-5",
+      "kimi-coding/k3.1-pro",
+      "antigravity-acp/gemini-4-carbon",
+      "antigravity-acp/gemini-3.8-flash",
+      "antigravity-acp/gemini-4-argon",
+    ]);
+    const d4Conf = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: acpOnlyReg, syncModels: true });
+    assert.equal(d4Conf.enabledModelsChanged, true);
+    assert.deepEqual(d4Conf.mergedSettings.enabledModels, ["antigravity-acp/gemini-4-argon"]);
+    await applyStewardDiff(d4Conf, fixture.agentDir);
+
+    // 5. Ctrl+A (enabledModels key deleted -> undefined): stays unrestricted while advancing seenVisibleCanon
+    fs.writeFileSync(settingsPath, JSON.stringify({}, null, 2) + "\n", "utf8");
+    const allReg = makeFakeRegistry({ xai: true, "kimi-coding": true, "antigravity-acp": true });
+    const d5 = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: allReg, syncModels: true });
+    assert.equal(d5.settingsChanged, false);
+    assert.equal(d5.mergedSettings.enabledModels, undefined);
+    assert.equal(d5.syncStateChanged, true);
+    assert.ok(d5.nextSyncState.seenVisibleCanon?.includes("xai/grok-5"));
+  } finally {
+    fs.rmSync(fixture.tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("pi-steward logout/re-login stays seamless, Canon deletion cleans local list, and unregistered providers stay unknown", async () => {
+  const fixture = createModelSyncFixture([
+    "xai/grok-4.7",
+    "kimi-coding/k3.1-pro-highspeed",
+    "kimi-coding/k3.1-pro",
+    "unloaded-ext/future-model",
+  ]);
+  try {
+    // Unknown provider: getProvider returns undefined even though getProviderAuthStatus returns configured: false
+    const regBoth = makeFakeRegistry({ xai: true, "kimi-coding": true });
+    const probe = createProviderVisibilityProbe(regBoth);
+    assert.equal(probe?.("unloaded-ext"), "unknown");
+
+    const dInit = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: regBoth, syncModels: true });
+    assert.deepEqual(dInit.missingAuthProviders, []);
+    assert.deepEqual(dInit.mergedSettings.enabledModels, [
+      "xai/grok-4.7",
+      "kimi-coding/k3.1-pro-highspeed",
+      "kimi-coding/k3.1-pro",
+    ]);
+    await applyStewardDiff(dInit, fixture.agentDir);
+
+    // User deletes kimi-coding/k3.1-pro locally and adds kimi-coding/custom
+    const settingsPath = path.join(fixture.agentDir, "settings.json");
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify({ enabledModels: ["kimi-coding/custom", "kimi-coding/k3.1-pro-highspeed", "xai/grok-4.7"] }, null, 2) + "\n",
+      "utf8",
+    );
+
+    // Temporary logout of kimi-coding: neither local enabledModels nor seenVisibleCanon shrinks
+    const regKimiOut = makeFakeRegistry({ xai: true, "kimi-coding": false });
+    const dOut = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: regKimiOut, syncModels: true });
+    assert.equal(dOut.settingsChanged, false);
+    assert.equal(dOut.syncStateChanged, false);
+    assert.deepEqual(dOut.nextSyncState.seenVisibleCanon, [
+      "xai/grok-4.7",
+      "kimi-coding/k3.1-pro-highspeed",
+      "kimi-coding/k3.1-pro",
+    ]);
+
+    // While kimi-coding is logged out, Canon adds kimi-coding/k3.2-new and deletes xai/grok-4.7
+    fixture.writeCanon([
+      "kimi-coding/k3.1-pro-highspeed",
+      "kimi-coding/k3.1-pro",
+      "kimi-coding/k3.2-new",
+      "unloaded-ext/future-model",
+    ]);
+    const dWhileOut = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: regKimiOut, syncModels: true });
+    assert.deepEqual(dWhileOut.mergedSettings.enabledModels, ["kimi-coding/custom", "kimi-coding/k3.1-pro-highspeed"]);
+    assert.ok(!dWhileOut.nextSyncState.seenVisibleCanon?.includes("kimi-coding/k3.2-new"));
+    await applyStewardDiff(dWhileOut, fixture.agentDir);
+
+    // Re-login kimi-coding: deleted k3.1-pro is NOT resurrected, custom & order stay intact, k3.2-new appends
+    const dReIn = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: regBoth, syncModels: true });
+    assert.deepEqual(dReIn.mergedSettings.enabledModels, [
+      "kimi-coding/custom",
+      "kimi-coding/k3.1-pro-highspeed",
+      "kimi-coding/k3.2-new",
+    ]);
+    assert.deepEqual(dReIn.nextSyncState.seenVisibleCanon, [
+      "kimi-coding/k3.1-pro-highspeed",
+      "kimi-coding/k3.1-pro",
+      "kimi-coding/k3.2-new",
+    ]);
+  } finally {
+    fs.rmSync(fixture.tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("pi-steward migrates v1 lastSyncedCanonModels smoothly and /hub-init preserves v1 marker until migration succeeds", async () => {
+  const fixture = createModelSyncFixture(["xai/grok-4.7", "xai/grok-new", "kimi-coding/k3.1-pro"]);
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  try {
+    // Seed a v1 machine that ONLY has legacy lastSyncedCanonModels in machine.json (no state file yet)
+    execFileSync("git", ["init", "-q", fixture.repoDir]);
+    fs.writeFileSync(
+      path.join(fixture.agentDir, "machine.json"),
+      JSON.stringify(
+        {
+          machineId: "old-box",
+          lastSyncedCanonModels: ["xai/grok-4.7", "kimi-coding/k3.1-pro", "xai/retired-model"],
+        },
+        null,
+        2,
+      ) + "\n",
+      "utf8",
+    );
+    // User previously deleted xai/grok-4.7 locally, still had retired-model and custom/local
+    fs.writeFileSync(
+      path.join(fixture.agentDir, "settings.json"),
+      JSON.stringify({ enabledModels: ["custom/local", "xai/retired-model"] }, null, 2) + "\n",
+      "utf8",
+    );
+
+    process.env.PI_CODING_AGENT_DIR = fixture.agentDir;
+    const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
+    const fakePi = {
+      on() {},
+      registerCommand(name: string, spec: { handler: (args: string, ctx: any) => Promise<void> }) {
+        commands.set(name, spec.handler);
+      },
+    };
+    registerPiSteward(fakePi as unknown as Parameters<typeof registerPiSteward>[0]);
+
+    const xaiOnlyReg = makeFakeRegistry({ xai: true, "kimi-coding": false });
+    await commands.get("hub-init")?.(`old-box ${fixture.repoDir}`, {
+      mode: "tui",
+      hasUI: true,
+      modelRegistry: xaiOnlyReg,
+      ui: { notify() {} },
+    });
+
+    const settings = JSON.parse(fs.readFileSync(path.join(fixture.agentDir, "settings.json"), "utf8"));
+    // retired-model removed, previously-deleted xai/grok-4.7 NOT resurrected, new xai/grok-new added, unconfigured kimi not added
+    assert.deepEqual(settings.enabledModels, ["custom/local", "xai/grok-new"]);
+
+    const state = readSyncState(fixture.agentDir);
+    assert.deepEqual(state.seenVisibleCanon, ["xai/grok-4.7", "xai/grok-new"]);
+    assert.equal(state.lastSyncedCanonModels, undefined);
+
+    const markerAfter = JSON.parse(fs.readFileSync(path.join(fixture.agentDir, "machine.json"), "utf8"));
+    assert.equal(markerAfter.lastSyncedCanonModels, undefined);
+
+    // Later login to kimi-coding imports kimi-coding/k3.1-pro because v1 migration intersected with V
+    const bothReg = makeFakeRegistry({ xai: true, "kimi-coding": true });
+    const dLater = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: bothReg, syncModels: true });
+    assert.deepEqual(dLater.mergedSettings.enabledModels, ["custom/local", "xai/grok-new", "kimi-coding/k3.1-pro"]);
+  } finally {
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    fs.rmSync(fixture.tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("pi-steward blocks model sync and login guide in headless/print/rpc modes, shows TUI login guide once, and reports missing providers in /hub-status", async () => {
+  const fixture = createModelSyncFixture(["xai/grok-4.7", "kimi-coding/k3.1-pro"]);
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const prevOffline = process.env.PI_OFFLINE;
+  try {
+    execFileSync("git", ["init", "-q", fixture.repoDir]);
+    fs.writeFileSync(
+      path.join(fixture.agentDir, "machine.json"),
+      JSON.stringify({ machineId: "tui-box", hubRepoPath: fixture.repoDir }, null, 2) + "\n",
+      "utf8",
+    );
+    process.env.PI_CODING_AGENT_DIR = fixture.agentDir;
+    process.env.PI_OFFLINE = "1";
+
+    const handlers = new Map<string, (...args: any[]) => Promise<void>>();
+    const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
+    const fakePi = {
+      on(event: string, fn: (...args: any[]) => Promise<void>) {
+        handlers.set(event, fn);
+      },
+      registerCommand(name: string, spec: { handler: (args: string, ctx: any) => Promise<void> }) {
+        commands.set(name, spec.handler);
+      },
+    };
+    registerPiSteward(fakePi as unknown as Parameters<typeof registerPiSteward>[0]);
+
+    const xaiOnlyReg = makeFakeRegistry({ xai: true, "kimi-coding": false });
+    const notices: string[] = [];
+
+    // 1. Subagent / print mode must NOT write enabledModels, seenVisibleCanon, or loginGuideShown
+    await handlers.get("session_start")?.(
+      { reason: "startup" },
+      { mode: "print", hasUI: false, modelRegistry: xaiOnlyReg, ui: { notify(m: string) { notices.push(m); } } },
+    );
+    const settingsAfterPrint = fs.existsSync(path.join(fixture.agentDir, "settings.json"))
+      ? JSON.parse(fs.readFileSync(path.join(fixture.agentDir, "settings.json"), "utf8"))
+      : {};
+    assert.equal(settingsAfterPrint.enabledModels, undefined);
+    const stateAfterPrint = readSyncState(fixture.agentDir);
+    assert.equal(stateAfterPrint.seenVisibleCanon, undefined);
+    assert.equal(stateAfterPrint.loginGuideShown, undefined);
+
+    // 2. First TUI start syncs enabledModels and shows one-time login guide for kimi-coding
+    notices.length = 0;
+    await handlers.get("session_start")?.(
+      { reason: "startup" },
+      { mode: "tui", hasUI: true, modelRegistry: xaiOnlyReg, ui: { notify(m: string) { notices.push(m); }, setStatus() {} } },
+    );
+    const settingsAfterTui = JSON.parse(fs.readFileSync(path.join(fixture.agentDir, "settings.json"), "utf8"));
+    assert.deepEqual(settingsAfterTui.enabledModels, ["xai/grok-4.7"]);
+    assert.equal(readSyncState(fixture.agentDir).loginGuideShown, true);
+    assert.ok(notices.some((m) => m.includes("尚未登录的厂商（kimi-coding）") && m.includes("/reload") && m.includes("/new")));
+
+    // 3. Second TUI start does NOT repeat login guide toast
+    notices.length = 0;
+    await handlers.get("session_start")?.(
+      { reason: "startup" },
+      { mode: "tui", hasUI: true, modelRegistry: xaiOnlyReg, ui: { notify(m: string) { notices.push(m); }, setStatus() {} } },
+    );
+    assert.ok(!notices.some((m) => m.includes("尚未登录的厂商")));
+
+    // 4. /hub-status still displays missing providers read-only
+    notices.length = 0;
+    await commands.get("hub-status")?.("", {
+      mode: "tui",
+      hasUI: true,
+      modelRegistry: xaiOnlyReg,
+      ui: { notify(m: string) { notices.push(m); } },
+    });
+    assert.ok(notices.some((m) => m.includes("缺登厂商：kimi-coding")));
+  } finally {
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    if (prevOffline === undefined) delete process.env.PI_OFFLINE;
+    else process.env.PI_OFFLINE = prevOffline;
+    fs.rmSync(fixture.tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("pi-steward mergeCanonModelsForPromote isolates unconfigured providers and is zero-diff on re-run", () => {
+  const canon = [
+    "xai/grok-4.7",
+    "kimi-coding/k3.1-pro-highspeed",
+    "antigravity-acp/gemini-4-carbon",
+    "kimi-coding/k3.1-pro",
+    "antigravity-acp/gemini-4-argon",
+  ];
+  const reg = makeFakeRegistry({ xai: true, "kimi-coding": true, "antigravity-acp": false, openai: true });
+
+  // Explicit mode: add/remove configured providers, reject unconfigured/unknown
+  const exp1 = mergeCanonModelsForPromote(canon, {
+    mode: "explicit",
+    remove: ["xai/grok-4.7"],
+    add: ["xai/grok-5", "kimi-coding/k3.1-pro"],
+    modelRegistry: reg,
+  });
+  assert.deepEqual(exp1, [
+    "kimi-coding/k3.1-pro-highspeed",
+    "antigravity-acp/gemini-4-carbon",
+    "kimi-coding/k3.1-pro",
+    "antigravity-acp/gemini-4-argon",
+    "xai/grok-5",
+  ]);
+  // Re-run produces zero diff
+  const exp2 = mergeCanonModelsForPromote(exp1, {
+    mode: "explicit",
+    remove: ["xai/grok-4.7"],
+    add: ["xai/grok-5", "kimi-coding/k3.1-pro"],
+    modelRegistry: reg,
+  });
+  assert.deepEqual(exp2, exp1);
+
+  assert.throws(
+    () =>
+      mergeCanonModelsForPromote(canon, {
+        mode: "explicit",
+        remove: ["antigravity-acp/gemini-4-carbon"],
+        modelRegistry: reg,
+      }),
+    /unconfigured provider "antigravity-acp"/,
+  );
+  assert.throws(
+    () =>
+      mergeCanonModelsForPromote(canon, {
+        mode: "explicit",
+        add: ["unknown-vendor/m1"],
+        modelRegistry: reg,
+      }),
+    /unknown provider "unknown-vendor"/,
+  );
+
+  // Align-providers mode: rejects [] and undefined; rejects unconfigured targets
+  assert.throws(
+    () =>
+      mergeCanonModelsForPromote(canon, {
+        mode: "align-providers",
+        localModels: [],
+        targetProviders: ["kimi-coding"],
+        modelRegistry: reg,
+      }),
+    /non-empty/,
+  );
+  assert.throws(
+    () =>
+      mergeCanonModelsForPromote(canon, {
+        mode: "align-providers",
+        localModels: undefined,
+        targetProviders: ["kimi-coding"],
+        modelRegistry: reg,
+      }),
+    /non-empty/,
+  );
+  assert.throws(
+    () =>
+      mergeCanonModelsForPromote(canon, {
+        mode: "align-providers",
+        localModels: ["antigravity-acp/gemini-4-carbon"],
+        targetProviders: ["antigravity-acp"],
+        modelRegistry: reg,
+      }),
+    /unconfigured provider "antigravity-acp"/,
+  );
+
+  // Align-providers replaces slots in-place, flushes overflow after last slot, appends new provider, freezes others
+  const localModels = [
+    "kimi-coding/k3.1-pro",
+    "kimi-coding/k3.2-turbo",
+    "kimi-coding/k3.2-lite",
+    "openai/gpt-5",
+  ];
+  const aligned1 = mergeCanonModelsForPromote(canon, {
+    mode: "align-providers",
+    localModels,
+    targetProviders: ["kimi-coding", "openai"],
+    modelRegistry: reg,
+  });
+  assert.deepEqual(aligned1, [
+    "xai/grok-4.7",
+    "kimi-coding/k3.1-pro",
+    "antigravity-acp/gemini-4-carbon",
+    "kimi-coding/k3.2-turbo",
+    "kimi-coding/k3.2-lite",
+    "antigravity-acp/gemini-4-argon",
+    "openai/gpt-5",
+  ]);
+  // Re-run produces zero diff
+  const aligned2 = mergeCanonModelsForPromote(aligned1, {
+    mode: "align-providers",
+    localModels,
+    targetProviders: ["kimi-coding", "openai"],
+    modelRegistry: reg,
+  });
+  assert.deepEqual(aligned2, aligned1);
+});
+
+test("pi-steward applyStewardDiff merges managed keys inside lock, aborts on enabledModels conflict, and never falls back on lock failure", async () => {
+  const fixture = createModelSyncFixture(["xai/grok-4.7"]);
+  try {
+    const settingsPath = path.join(fixture.agentDir, "settings.json");
+    const statePath = path.join(fixture.agentDir, ".pi-steward-state.json");
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify({ modelThinkingLevels: { "xai/grok-4.7": "medium" }, enabledModels: [] }, null, 2) + "\n",
+      "utf8",
+    );
+
+    const reg = makeFakeRegistry({ xai: true });
+    const diff = computeStewardDiff(fixture.repoDir, fixture.agentDir, { modelRegistry: reg, syncModels: true });
+    assert.equal(diff.enabledModelsChanged, true);
+
+    // 1. Lock failure must NOT fall back to writing settings.json or advancing state
+    const failingLock = {
+      withLock() {
+        throw new Error("lock busy");
+      },
+    };
+    const failRes = await applyStewardDiff(diff, fixture.agentDir, { settingsStorage: failingLock });
+    assert.equal(failRes.applied, false);
+    assert.match(failRes.lockError ?? "", /lock busy/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf8")).enabledModels, []);
+    assert.equal(fs.existsSync(statePath), false);
+
+    // 2. Concurrent enabledModels edit detected inside lock -> returns undefined, skips write and state advance
+    let conflictWritten = false;
+    const conflictLock = {
+      withLock(_scope: "global", fn: (current: string | undefined) => string | undefined) {
+        const concurrentDisk = JSON.stringify({
+          modelThinkingLevels: { "xai/grok-4.7": "high" },
+          enabledModels: ["user/just-added"],
+        });
+        const next = fn(concurrentDisk);
+        if (next !== undefined) conflictWritten = true;
+      },
+    };
+    const conflictRes = await applyStewardDiff(diff, fixture.agentDir, { settingsStorage: conflictLock });
+    assert.equal(conflictRes.applied, false);
+    assert.equal(conflictRes.conflict, true);
+    assert.equal(conflictWritten, false);
+    assert.equal(fs.existsSync(statePath), false);
+
+    // 3. Concurrent unmanaged key update (modelThinkingLevels/theme) inside lock is preserved
+    let savedJson = "";
+    const preservingLock = {
+      withLock(_scope: "global", fn: (current: string | undefined) => string | undefined) {
+        const concurrentDisk = JSON.stringify({
+          modelThinkingLevels: { "xai/grok-4.7": "high" },
+          theme: "dark-pro",
+          enabledModels: [],
+        });
+        const next = fn(concurrentDisk);
+        assert.ok(next !== undefined);
+        savedJson = next!;
+        fs.writeFileSync(settingsPath, next!, "utf8");
+      },
+    };
+    const okRes = await applyStewardDiff(diff, fixture.agentDir, { settingsStorage: preservingLock });
+    assert.equal(okRes.applied, true);
+    assert.equal(okRes.settingsWritten, true);
+    const parsedSaved = JSON.parse(savedJson);
+    assert.deepEqual(parsedSaved.modelThinkingLevels, { "xai/grok-4.7": "high" });
+    assert.equal(parsedSaved.theme, "dark-pro");
+    assert.deepEqual(parsedSaved.enabledModels, ["xai/grok-4.7"]);
+    assert.deepEqual(readSyncState(fixture.agentDir).seenVisibleCanon, ["xai/grok-4.7"]);
+  } finally {
+    fs.rmSync(fixture.tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("agy-acp-official.cjs is desensitized, fixes official CCPA endpoint, resolves agy from PATH, and keeps syncLegacyAuthMarker guard", () => {
+  const shimPath = path.join(REPO_ROOT, "scripts", "agy-acp-official.cjs");
+  const st = fs.statSync(shimPath);
+  assert.ok((st.mode & 0o111) !== 0, "scripts/agy-acp-official.cjs must be executable");
+
+  const src = fs.readFileSync(shimPath, "utf8");
+  assert.ok(src.startsWith("#!/usr/bin/env node\n"), "shebang must be preserved");
+  assert.doesNotMatch(src, /AGY_ACP_CCPA_BASE_URL/);
+  assert.doesNotMatch(src, /\/(?:home|Users)\/[A-Za-z0-9._-]+/);
+  assert.match(src, /https:\/\/cloudcode-pa\.googleapis\.com/);
+  assert.match(src, /function syncLegacyAuthMarker\(\)/);
+
+  // Runtime check: resolves fake `agy` from PATH (no AGY_REAL_BIN, no ~/.local/bin/agy) and heals acp_token.json
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "agy-shim-test-"));
+  const fakeBinDir = path.join(tmpHome, "bin");
+  try {
+    fs.mkdirSync(fakeBinDir, { recursive: true });
+    const fakeAgy = path.join(fakeBinDir, "agy");
+    fs.writeFileSync(fakeAgy, "#!/bin/sh\necho \"FAKE_AGY_ARGS:$*\"\n", { mode: 0o755 });
+
+    const oauthTokenPath = path.join(tmpHome, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+    fs.mkdirSync(path.dirname(oauthTokenPath), { recursive: true });
+    fs.writeFileSync(oauthTokenPath, JSON.stringify({ token: { access_token: "dummy" } }) + "\n", "utf8");
+
+    const env = { ...process.env, HOME: tmpHome, PATH: `${fakeBinDir}:${process.env.PATH ?? ""}` };
+    delete env.AGY_REAL_BIN;
+    delete env.GEMINI_HOME;
+    delete env.ANTIGRAVITY_APP_DATA_DIR;
+
+    const stdout = execFileSync(process.execPath, [shimPath, "--help"], { env, encoding: "utf8" });
+    assert.match(stdout, /FAKE_AGY_ARGS:acp --dangerously-skip-permissions --help/);
+
+    const legacyMarker = path.join(tmpHome, ".gemini", "antigravity-acp", "acp_token.json");
+    assert.equal(fs.existsSync(legacyMarker), true);
+    assert.match(fs.readFileSync(legacyMarker, "utf8"), /managed-by-antigravity-cli/);
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
   }
 });
