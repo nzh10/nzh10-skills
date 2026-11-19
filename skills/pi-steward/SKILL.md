@@ -1,6 +1,6 @@
 ---
 name: pi-steward
-description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（canon/settings.canon.json、canon/AGENTS.md、canon/plain-check.toml）与单机试验沉淀池（pools/*/incubating.json）。仅当用户要求把某个 Pi 插件/规则/技能转正（promote）到全局 canon、从 canon 全局卸载某个 Pi 插件/模型、把本机试用中的 Pi 插件存进沉淀池、查看/调取某台机器的沉淀池、或初始化新机器冷启动环境时使用。不处理业务代码仓库或单个业务 skill 的评测。
+description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（canon/settings.canon.json、canon/AGENTS.md、canon/plain-check.toml）与单机试验沉淀池（pools/*/incubating.json）。仅当用户要求把某个 Pi 插件/规则/技能转正（promote）到全局 canon、从 canon 全局卸载某个 Pi 插件/模型、把本机试用中的 Pi 插件或点名的公共 Skill 可见性存进沉淀池、将公共 Skill 可见性转为仓库默认、查看/调取某台机器的沉淀池、或初始化新机器冷启动环境时使用。不处理业务代码仓库或单个业务 skill 的评测。
 ---
 
 # Pi 跨端配置与沉淀池管理 (pi-steward)
@@ -23,7 +23,7 @@ description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（c
    - `canon/AGENTS.md`：英文 ASD-STE100 全局通用规则（首次接管非空本地 `AGENTS.md` 时，`pi-steward.ts` 自动备份为 `AGENTS.md.bak`）。
    - `canon/plain-check.toml`：跨平台黑话拦截器全局规则（启动与 `/reload` 时自动同步至 `<agentDir>/plain-check.toml`，首次接管非空旧文件时自动备份 `.bak`）。
 2. **各机器沉淀池 (`<hubRepoPath>/pools/<machineId>/`)**：
-   - `incubating.json`：备份该机可跨机安装的试用包（`npm:`/`git:`）与脱敏备注（严禁写入含真实用户名/家目录的本机绝对路径）。
+   - `incubating.json`：记录可跨机安装的试用包（`npm:`/`git:`）、脱敏备注和明确收录的公共 Skill 可见性。可见性记录是候选，不参与运行时合并。
    - `machine-env.md`：脱敏单机环境模板（严禁含真实用户名、hostname 或个人路径），本机 `APPEND_SYSTEM.md` 为空时用于首次初始化。
    - `pools/<machineId>/skills/`：该机器正在试验、尚未晋升到顶层 `skills/` 的半成品技能备份。
 3. **本机运行层 (`<agentDir>/`)**：
@@ -33,6 +33,18 @@ description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（c
    - 空白 WSL / Linux 机器（甚至缺失系统 `python3`、`uv`、`ntn`）无需 `sudo`，先运行 `sh <hubRepoPath>/scripts/bootstrap-cli.sh --check` 检查；只要用户问到「缺的话怎么装 / 如何安装」或确实缺失工具，无论当前检查是否已装齐，都在回复中明确附上一键补装命令 `sh <hubRepoPath>/scripts/bootstrap-cli.sh --install`（在 `~/.local/bin` 安装 `uv`、托管 Python 3.12 与 `ntn`）。
 
 ---
+
+## Skillful：本机可见性与仓库默认
+
+`machine.json` 可用 `skillful.enabled: true` 启用、用 `false` 关闭；未指定时沿用该机的安装选择。已启用的机器加载当前仓库 `packages/pi-skillful/`，与 npm 来源保持单份。共享默认放在 `canon/settings.canon.json` 的 `skillful.visibility`。
+
+对 Pi 已加载的本仓公共 Skill 和顶层个人 Skill，菜单按单项保存。可信 Project 优先于本机 Global，本机 Global 优先于仓库默认。「跟随上层」只撤掉选中项的限制；旧名单保持原义，已明确选择跟随的单项可跳过旧名单。隐藏只影响模型自动发现，手动调用保持可用。菜单、更改来源、入池和转正 Skill 内容是各自独立的操作。
+
+明确要求收录或转正某个公共 Skill 时，使用工作仓 `skills/pi-steward/scripts/skillful-visibility.mjs`：
+
+1. 用 `collect --id hub:skills/<path>/SKILL.md` 收录本机 Global 对该项的显式 `show` 或 `hide`；先跑现有 preflight，再写当前机器池。隐私路径、Project 设置和其他本机设置留在原处。
+2. 用 `promote --id <id> --pool <machineId>` 或 `promote --id <id> --value show|hide` 预览。向用户说明 canon 当前值和目标值；若当前已不是池记录的基线且不同于目标，先处理冲突。
+3. 明确转正时用 `promote --id <id> --value <预览的目标值> --apply --expected <基线：null|show|hide>`。脚本再次运行 preflight，只合入这一个 ID；已是目标值时不重写，不清除本机偏好。尚未发布的内容须已放在 `skills/` 下并当次明确同时转正，才使用 `--content-promoted`。提交和推送是独立操作。
 
 ## 强制前置检查（每次写仓前必跑脚本）
 

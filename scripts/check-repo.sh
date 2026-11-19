@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fast (<1s), offline, deterministic repository self-check.
+# Offline, deterministic repository self-check.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
@@ -14,13 +14,19 @@ for sh_file in \
   sh -n "$sh_file"
 done
 
-# 2. Upstream patch reverse-application check on skills/skill-creator
-if [ -f "$root/patches/skill-creator.patch" ] && [ -d "$root/skills/skill-creator" ]; then
-  if ! git -C "$root" apply --reverse --check --unsafe-paths "$root/patches/skill-creator.patch" >/dev/null 2>&1; then
-    echo "check-repo: skills/skill-creator/ has unpatched drift relative to patches/skill-creator.patch" >&2
-    exit 1
+# 2. Managed upstream copies must contain their patches.
+for managed in skill-creator pi-skillful; do
+  case "$managed" in
+    skill-creator) dest=skills/skill-creator ;;
+    pi-skillful) dest=packages/pi-skillful ;;
+  esac
+  if [ -f "$root/patches/$managed.patch" ] && [ -d "$root/$dest" ]; then
+    if ! git -C "$root" apply --reverse --check --unsafe-paths "$root/patches/$managed.patch" >/dev/null 2>&1; then
+      echo "check-repo: $dest has unpatched drift relative to patches/$managed.patch" >&2
+      exit 1
+    fi
   fi
-fi
+done
 
 # 3. Pi configuration/entry points and Node syntax, with explicit TypeScript stripping.
 node "$root/scripts/check-pi-node.mjs" "$root"
@@ -46,6 +52,21 @@ if (fs.existsSync(path.join(root, "upstream.json"))) {
   readJson("upstream.json");
 }
 
+const publicId = /^hub:skills\/(?:[a-zA-Z0-9_-][a-zA-Z0-9_.-]*\/)*[a-zA-Z0-9_-][a-zA-Z0-9_.-]*\.md$/;
+const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
+const visibilityValue = value => value === "show" || value === "hide";
+function checkVisibility(map, collected = false) {
+  if (map === undefined) return;
+  if (!isObject(map)) throw new Error("Skillful visibility must be an object");
+  for (const [id, entry] of Object.entries(map)) {
+    const valid = collected
+      ? isObject(entry) && Object.keys(entry).length === 2 && (entry.base === null || visibilityValue(entry.base)) && visibilityValue(entry.value)
+      : visibilityValue(entry);
+    if (!publicId.test(id) || !valid) throw new Error("Invalid public Skillful visibility entry");
+  }
+}
+const canon = readJson("canon/settings.canon.json");
+checkVisibility(canon?.skillful?.visibility);
 const poolsDir = path.join(root, "pools");
 if (fs.existsSync(poolsDir)) {
   for (const entry of fs.readdirSync(poolsDir, { withFileTypes: true })) {
@@ -57,6 +78,7 @@ if (fs.existsSync(poolsDir)) {
         throw new Error(`Home path leak in pools/${entry.name}/incubating.json`);
       }
       const inc = JSON.parse(rawInc);
+      checkVisibility(inc?.settings?.skillful?.visibility, true);
       if (inc.machineId && inc.machineId !== entry.name) {
         throw new Error(`machineId mismatch in pools/${entry.name}/incubating.json: ${inc.machineId}`);
       }

@@ -1,0 +1,1363 @@
+diff --git a/packages/pi-skillful/AGENTS.md b/packages/pi-skillful/AGENTS.md
+index f4da85b..dd5825d 100644
+--- a/packages/pi-skillful/AGENTS.md
++++ b/packages/pi-skillful/AGENTS.md
+@@ -5,7 +5,7 @@ Root `AGENTS.md` applies.
+ ## Invariants
+
+ - Hidden skills remain explicitly invokable.
+-- Package-bundled skills are never hidden or assigned toggle slots.
++- Package-bundled skills are never assigned new toggle slots. Visibility additionally accepts only verified hub package resources under the hub's real `skills/` root; third-party package skills remain untouched.
+ - Project settings require active trust; global inheritance remains intact.
+ - Compose editor wrappers with focus, IME, hooks, and previous editor behavior.
+ - Startup coloring uses private Pi UI API: isolate it and keep integration coverage that fails if patch wiring disappears.
+@@ -28,12 +28,13 @@ Four features are wired in `extensions/index.ts`. There is no runtime build step
+
+ 1. **Progressive skill discovery** (`src/extensions/progressive-skills.ts`): hooks `pi.on("resources_discover")` to add `.agents/skills/` directories from every ancestor above the git root, which Pi's own discovery stops at. `~/.agents/skills` is skipped because Pi loads it globally.
+ 2. **Inline skill invocation** (`src/extensions/inline-skill-invocation.ts`): hooks `pi.on("input")` to expand `/skill:name` markers anywhere in the prompt, not just at the start. Each known marker is replaced with a `<skill>` block built from the skill's `SKILL.md` (`readSkillBlock`) and the input is transformed before Pi's own expansion runs; unknown or unreadable skills produce a warning notice.
+-3. **Skill visibility** (`src/extensions/skill-visibility.ts`): hooks `pi.on("before_agent_start")` and marks hidden top-level skills `disableModelInvocation: true` in `event.systemPromptOptions.skills`, so Pi omits them from the prompt's skill list. It defers to session toggles while any toggle slot is active (`hasActiveSessionSkillToggles`). Also registers the `/skillful` command, a TUI menu backed by `SettingsList`.
+-   The startup `[Skills]` list is colorized by `installStartupSkillListPatch`, which monkey-patches `InteractiveMode.prototype.showLoadedResources`. It records skill names through a temporary `resourceLoader.getSkills` wrapper, then decorates the `[Skills]` entry: on Pi 1.x it wraps the component's `build()` and colorizes only the collapsed text; on older Pi it replaces `getCollapsedText`. Colors are computed lazily from `store.hiddenSkillsByCwd` and the current theme. `Symbol.for("pi-skillful.startupPatchV4")` on the prototype guards against double-patching across hot reloads; the singleton store is keyed at `Symbol.for("pi-skillful.skillVisibilityStore")` on `globalThis`.
++3. **Skill visibility** (`src/extensions/skill-visibility.ts`): hooks `pi.on("before_agent_start")` and marks hidden top-level skills `disableModelInvocation: true` in `event.systemPromptOptions.skills`, so Pi omits them from the prompt's skill list. Only actually pressed session shortcuts override persistent per-item visibility. Also registers the `/skillful` command, a TUI menu backed by `SettingsList`.
++   The startup `[Skills]` list is colorized by `installStartupSkillListPatch`, which monkey-patches `InteractiveMode.prototype.showLoadedResources`. It records skill names through a temporary `resourceLoader.getSkills` wrapper, then decorates the `[Skills]` entry: on Pi 1.x it wraps the component's `build()` and colorizes only the collapsed text; on older Pi it replaces `getCollapsedText`. Colors are computed lazily from scoped settings in `store.scopedByCwd` and the current theme. `Symbol.for("pi-skillful.startupPatchV5")` on the prototype guards against double-patching across hot reloads; the singleton store is keyed at `Symbol.for("pi-skillful.skillVisibilityStore")` on `globalThis`.
+ 4. **Session skill toggles** (`src/extensions/session-skill-toggles.ts`): assigns skills to keyboard shortcut slots `1`–`9` through `skillful.toggleSlots`, with the modifier from `skillful.toggleModifier` (default `alt`, for example Alt+1). Renders active/inactive state in the top border of a custom editor; when another extension already set an editor, it wraps that editor instead of replacing it. Hooks `before_agent_start` to mark toggled-off top-level skills `disableModelInvocation: true` in `event.systemPromptOptions.skills`. Slot active-state survives a `session_shutdown`/`session_start` pair with reason `"new"` in the same cwd; the store is keyed at `Symbol.for("pi-skillful.sessionSkillTogglesStore")`.
+
+ | Module | Role |
+ |---|---|
+-| `src/config.ts` | Reads/writes `skillful.hiddenSkills`, `skillful.toggleSlots`, and `skillful.toggleModifier` in `<getAgentDir()>/settings.json` and `<cwd>/<CONFIG_DIR_NAME>/settings.json`. Project settings are read only when trusted. Each key is scoped independently: a project value, when defined, replaces the global value; otherwise the global value applies. |
++| `src/config.ts` | Reads/writes per-identity `skillful.visibility`, legacy `skillful.hiddenSkills`, `skillful.toggleSlots`, and `skillful.toggleModifier` in `<getAgentDir()>/settings.json` and `<cwd>/<CONFIG_DIR_NAME>/settings.json`. Project settings are read only when trusted. Visibility resolves each identity Project > Global > read-only Global `visibilityDefaults` > Pi. Legacy name lists retain replacement semantics for top-level skills only; toggles retain independent scope inheritance. Writes merge the locked current document and rename atomically under the SDK same-scope lock. |
+ | `src/skills.ts` | Lists loaded skills from Pi commands (`listLoadedSkills`, `sourceInfoToSkill`), classifies top-level skills (`isTopLevelSkill`), and reads a skill's `SKILL.md` into a `<skill>` block with frontmatter stripped (`readSkillBlock`). |
++| `src/visibility.ts` | Shared loaded-source qualification, portable identity selection, legacy compatibility and per-item precedence. |
+ | `src/install-telemetry.ts` | Best-effort install telemetry (root policy). |
+diff --git a/packages/pi-skillful/README.md b/packages/pi-skillful/README.md
+index 6dcfc68..7f2636c 100644
+--- a/packages/pi-skillful/README.md
++++ b/packages/pi-skillful/README.md
+@@ -47,14 +47,14 @@ Hidden skills:
+ - remain loaded by Pi;
+ - remain available for explicit invocation with `/skill:name`, including inline invocation.
+
+-Skills bundled in Pi packages are never affected by `skillful`; only global and project skills can be hidden or toggled.
++Visibility covers top-level skills and verified `nzh10-skills` package resources beneath that repository’s real `skills/` root. Third-party package skills remain untouched; public package skills receive no new shortcut slots.
+
+-Configuration is stored under the `skillful` key in Pi settings:
++Configuration is stored under the `skillful` key in Pi settings (use the menu to select source-qualified IDs):
+
+ ```json
+ {
+   "skillful": {
+-    "hiddenSkills": ["pdf", "xlsx"]
++    "visibility": { "hub:skills/pi-steward/SKILL.md": "hide" }
+   }
+ }
+ ```
+@@ -64,7 +64,9 @@ Supported scopes:
+ - Global: `settings.json` in Pi's agent directory (`~/.pi/agent/settings.json` by default, or `$PI_CODING_AGENT_DIR/settings.json` when set)
+ - Project: `.pi/settings.json`
+
+-Project visibility and toggle slots inherit global settings until changed in the Project tab. When either is changed, Pi Skillful writes a full project override containing both `hiddenSkills` and `toggleSlots`. If the project state is changed back to match global, those project override keys are removed so the project inherits global again.
++New choices use `skillful.visibility: { "<source-qualified-id>": "show" | "hide" | "inherit" }`, independently in each scope. Each item resolves Project > Global > steward-managed Global `skillful.visibilityDefaults` (show/hide only) > Pi. Explicit choices remain explicit even when equal to the current parent. Inherit follows the parent without copying other entries or toggle slots. Legacy `hiddenSkills` (including Project `[]`) retains its original top-level-only semantics. The previously unused `visibleSkills` remains inert. Neither list is migrated or applied to newly supported public package skills. Selecting inherit retains an explicit bypass only when a legacy list would otherwise apply.
++
++Public IDs are `hub:<repository-relative path to SKILL.md>` beneath `skills/`. Private IDs use source paths: portable `project:`, `agent:` or `home:` references where appropriate, and local-only Global `file:` paths otherwise. Project changes to external paths without a portable reference are rejected with a notice; use Global instead. Visibility never installs unloaded resources. Neither show nor session toggles clear Pi frontmatter or another extension’s manual-only restriction.
+
+ Open the menu with:
+
+@@ -72,11 +74,11 @@ Open the menu with:
+ /skillful
+ ```
+
+-The menu lists configurable skills alphabetically. Toggle a skill off or on in the active scope. Use the Global/Project tabs to choose which settings file to edit. In the Project tab, inherited on/off values are shown normally; project overrides are highlighted. Press `1` through `9` on a selected skill to assign or clear that scope's session toggle slot. Visibility and toggle slots are independent.
++The menu lists configurable skills alphabetically. Choose show, hide or inherit in the active Global/Project tab. The description shows effective Skillful visibility. Press `1` through `9` on a top-level skill to assign or clear that scope’s session toggle slot. Visibility and toggle slots are independent; changing either does not snapshot the other.
+
+ Project settings are read and the Project tab is available only when Pi trusts the current project. In an untrusted project, `pi-skillful` ignores `.pi/settings.json` and exposes only global settings.
+
+-When the project settings file contains only `skillful` settings and the project override is removed, `.pi/settings.json` is deleted instead of leaving an empty settings file behind.
++An emptied regular Project settings file may be removed. Global settings and symlink targets remain valid JSON files even when empty.
+
+ ### Session skill toggles
+
+@@ -109,7 +111,7 @@ At very narrow widths, the complete border is clipped to the available columns.
+
+ Visibility and toggles target Pi 1.5.2's structured `systemPromptOptions.skills` API, not text replacement of the full system prompt. Pi records skill-list changes in the session transcript, alongside independent updates from other extensions such as Scout.
+
+-An active slot can lift a restriction from `skillful.hiddenSkills`, but does not clear `disable-model-invocation` frontmatter or a restriction applied by an earlier prompt handler. Later handlers see the updated list and can apply their own policy. Package-bundled skills remain outside Skillful's visibility controls and toggle slots.
++Only an actually pressed shortcut becomes a session override. Merely configuring a slot does not freeze persistent visibility. An active slot can lift a restriction from Skillful settings, but does not clear `disable-model-invocation` frontmatter or a restriction applied by an earlier prompt handler. Later handlers see the updated list and can apply their own policy. Third-party package skills remain outside Skillful’s controls, and public package skills receive no new toggle slots.
+
+ A deliberate full-prompt override from another extension (`systemPrompt` or `forceSystemPrompt`) takes precedence. Skillful updates the structured skill list but does not rewrite that override; its author controls any skill descriptions embedded in the replacement text. Explicit skill invocation remains available.
+
+@@ -146,7 +148,7 @@ pi -e /path/to/pi-mono/packages/pi-skillful
+ 1. Start Pi in a project with this package installed.
+ 2. Run `/skillful`.
+ 3. Select the Global or Project tab.
+-4. Toggle skills on/off.
++4. Choose show, hide or inherit.
+ 5. Send a prompt normally, or explicitly invoke hidden skills with `/skill:name` anywhere in the prompt.
+
+ Example:
+@@ -179,8 +181,36 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for developmen
+
+ ## Security
+
+-Please report security issues privately. See [SECURITY.md](SECURITY.md).
++Please report security issues privately. See the [upstream security policy](https://github.com/jvm/pi-mono/blob/main/packages/pi-skillful/SECURITY.md).
+
+ ## License
+
+ MIT. See [LICENSE](LICENSE).
++
++## Maintained local copy
++
++This optional package is synchronized from `jvm/pi-mono`, `packages/pi-skillful`.
++The repository records the upstream Git revision in `upstreams/pi-skillful.json`
++and reapplies `patches/pi-skillful.patch` using `scripts/sync-pi-skillful.sh`.
++Runtime sources, tests, other documentation and license are retained;
++the security policy is linked upstream. No dependencies or build caches are copied.
++
++Load only this local path or the npm package, never both. Pi supplies the host
++SDK peers. Local packages do not auto-install dependencies: the existing
++`@mocito/install-telemetry` dependency is optional at runtime here. A missing
++telemetry package skips reporting without disabling skill features; other
++loading errors are surfaced. Set `PI_TELEMETRY=0` or `PI_OFFLINE=1` to disable
++reporting before dependency loading.
++
++Global saves require an existing valid JSON-object settings file and the host
++`SettingsManager` storage lock. They merge the locked current document and
++atomically rename the result while that same SDK lock is held. A missing file,
++unavailable lock or malformed document fails closed. Project trust and empty
++project-file deletion retain upstream behavior.
++
++For offline maintenance, pass `--source /path/to/pi-mono` to the sync script.
++It exports tracked files at that checkout's HEAD, ignoring local changes.
++The patch is checked before replacement; a failed replacement restores the
++previous package and metadata. A hard kill or power loss can leave a
++`packages/.pi-skillful-sync.*` directory and sync lock: inspect the saved `old`
++tree and `old-meta` before manually recovering and removing the lock.
+diff --git a/packages/pi-skillful/extensions/index.ts b/packages/pi-skillful/extensions/index.ts
+index 15bfdeb..1ed2488 100644
+--- a/packages/pi-skillful/extensions/index.ts
++++ b/packages/pi-skillful/extensions/index.ts
+@@ -5,8 +5,8 @@ import { reportInstallTelemetry } from "../src/install-telemetry.js";
+ import skillVisibility from "../src/extensions/skill-visibility.js";
+ import sessionSkillToggles from "../src/extensions/session-skill-toggles.js";
+
+-export default function piSkillful(pi: ExtensionAPI) {
+-  reportInstallTelemetry();
++export default async function piSkillful(pi: ExtensionAPI) {
++  await reportInstallTelemetry();
+
+   progressiveSkills(pi);
+   inlineSkillInvocation(pi);
+diff --git a/packages/pi-skillful/package.json b/packages/pi-skillful/package.json
+index 3b02089..4817be2 100644
+--- a/packages/pi-skillful/package.json
++++ b/packages/pi-skillful/package.json
+@@ -36,7 +36,6 @@
+     "README.md",
+     "LICENSE",
+     "CHANGELOG.md",
+-    "SECURITY.md",
+     "CONTRIBUTING.md",
+     "CODE_OF_CONDUCT.md"
+   ],
+diff --git a/packages/pi-skillful/src/config.ts b/packages/pi-skillful/src/config.ts
+index 12cf5d1..1e48c78 100644
+--- a/packages/pi-skillful/src/config.ts
++++ b/packages/pi-skillful/src/config.ts
+@@ -1,6 +1,7 @@
+-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
++import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
++import { readFile } from "node:fs/promises";
+ import { dirname, join } from "node:path";
+-import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
++import { CONFIG_DIR_NAME, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+
+ export type SkillfulScope = "global" | "project";
+ export type SkillToggleSlot = "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
+@@ -19,7 +20,12 @@ export interface SkillToggleConfig {
+   toggleModifier: SkillToggleModifier;
+ }
+
++export type SkillVisibility = "show" | "hide" | "inherit";
++export type SkillVisibilityMap = Record<string, SkillVisibility>;
++
+ export interface SkillfulSettings extends SkillToggleConfig {
++  visibility: SkillVisibilityMap;
++  visibilityDefaults: SkillVisibilityMap;
+   hiddenSkills: string[];
+   hiddenSkillsDefined: boolean;
+   visibleSkills: string[];
+@@ -29,6 +35,7 @@ export interface SkillfulSettings extends SkillToggleConfig {
+
+ export interface EffectiveSkillfulSettings extends SkillfulSettings {
+   hiddenSkillSet: Set<string>;
++  scoped: Record<SkillfulScope, SkillfulSettings>;
+ }
+
+ interface PiSettingsDocument {
+@@ -101,7 +108,8 @@ async function readSettingsDocument(path: string): Promise<PiSettingsDocument> {
+   try {
+     const raw = await readFile(path, "utf-8");
+     const parsed = JSON.parse(raw) as unknown;
+-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as PiSettingsDocument) : {};
++    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Settings must be a JSON object.");
++    return parsed as PiSettingsDocument;
+   } catch (error) {
+     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+       return {};
+@@ -139,6 +147,9 @@ export async function readEffectiveSkillfulSettings(
+   const hiddenSkills = normalizeSkillNames(effectiveHiddenSkillSet(scoped));
+   const toggleSlots = scoped.project.toggleSlotsDefined ? scoped.project.toggleSlots : scoped.global.toggleSlots;
+   return {
++    scoped,
++    visibility: {},
++    visibilityDefaults: scoped.global.visibilityDefaults,
+     hiddenSkills,
+     hiddenSkillsDefined: scoped.global.hiddenSkillsDefined || scoped.project.hiddenSkillsDefined,
+     visibleSkills: [],
+@@ -181,9 +192,20 @@ export async function writeToggleSlots(
+   cwd: string,
+   toggleSlots: Partial<Record<SkillToggleSlot, string>>,
+   projectTrusted = false,
++): Promise<SkillfulSettings> {
++  return updateToggleSlots(scope, cwd, () => toggleSlots, projectTrusted);
++}
++
++export async function updateToggleSlots(
++  scope: SkillfulScope,
++  cwd: string,
++  updater: (slots: Partial<Record<SkillToggleSlot, string>>) => Partial<Record<SkillToggleSlot, string>>,
++  projectTrusted = false,
+ ): Promise<SkillfulSettings> {
+   return updateSkillfulSettings(scope, cwd, projectTrusted, (current) => {
+-    current.toggleSlots = normalizeToggleSlots(toggleSlots);
++    const inherited = scope === "project" && !Object.hasOwn(current, "toggleSlots")
++      ? (existsSync(globalSettingsPath()) ? settingsFromRecord(JSON.parse(readFileSync(globalSettingsPath(), "utf-8")).skillful).toggleSlots : {}) : {};
++    current.toggleSlots = normalizeToggleSlots(updater(Object.hasOwn(current, "toggleSlots") ? normalizeToggleSlots(current.toggleSlots) : inherited));
+   });
+ }
+
+@@ -213,8 +235,49 @@ async function updateSkillfulSettings(
+   }
+
+   const path = settingsPath(scope, cwd);
+-  const document = await readSettingsDocument(path);
++  // Pi's SDK calls the callback before acquiring a lock for an absent file.
++  // Bootstrap only the absent project document with O_EXCL, then re-read under
++  // the SDK's same-scope lock. Never replace a concurrently created document.
++  if (scope === "global" && !existsSync(path)) throw new Error("Global settings must exist before saving skillful settings.");
++  if (scope === "project" && !existsSync(path)) {
++    mkdirSync(dirname(path), { recursive: true });
++    try { writeFileSync(path, "{}\n", { flag: "wx", mode: 0o600 }); }
++    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
++  }
++  const manager = SettingsManager.create(cwd, getAgentDir(), { projectTrusted: scope === "project" });
++  const storage = (manager as unknown as {
++    storage?: { withLock(scope: SkillfulScope, fn: (current: string | undefined) => undefined): void };
++  }).storage;
++  if (typeof storage?.withLock !== "function") throw new Error("SDK settings lock is unavailable.");
++  let result: SkillfulSettings | undefined;
++  storage.withLock(scope, (current) => {
++    if (current === undefined) throw new Error(`${scope} settings disappeared before locking.`);
++    const document = JSON.parse(current.replace(/^\uFEFF/, "")) as unknown;
++    if (!document || typeof document !== "object" || Array.isArray(document)) throw new Error(`${scope} settings must be a JSON object.`);
++    result = updateDocument(document as PiSettingsDocument, updater);
++    const target = realpathSync(path);
++    const temporary = mkdtempSync(join(dirname(target), ".skillful-"));
++    try {
++      if (scope === "project" && Object.keys(document).length === 0 && !lstatSync(path).isSymbolicLink()) rmSync(target);
++      else {
++        const next = join(temporary, "settings.json");
++        writeFileSync(next, `${JSON.stringify(document, null, 2)}\n`, { mode: statSync(target).mode & 0o777 });
++        renameSync(next, target);
++      }
++    } finally { rmSync(temporary, { recursive: true, force: true }); }
++    return undefined;
++  });
++  if (!result) throw new Error("SDK settings lock did not run the update.");
++  return result;
++}
+
++function updateDocument(
++  document: PiSettingsDocument,
++  updater: (current: Record<string, unknown>) => void,
++): SkillfulSettings {
++  if (document.skillful !== undefined && (!document.skillful || typeof document.skillful !== "object" || Array.isArray(document.skillful))) {
++    throw new Error("skillful settings must be an object.");
++  }
+   const existingSkillful =
+     document[SKILLFUL_SETTINGS_KEY] && typeof document[SKILLFUL_SETTINGS_KEY] === "object" && !Array.isArray(document[SKILLFUL_SETTINGS_KEY])
+       ? (document[SKILLFUL_SETTINGS_KEY] as Record<string, unknown>)
+@@ -225,16 +288,7 @@ async function updateSkillfulSettings(
+   if (Object.keys(nextSkillful).length === 0) delete document[SKILLFUL_SETTINGS_KEY];
+   else document[SKILLFUL_SETTINGS_KEY] = nextSkillful as Partial<SkillfulSettings>;
+
+-  const result = settingsFromRecord(nextSkillful);
+-
+-  if (scope === "project" && Object.keys(document).length === 0) {
+-    await unlinkIfExists(path);
+-    return result;
+-  }
+-
+-  await mkdir(dirname(path), { recursive: true });
+-  await writeFile(path, `${JSON.stringify(document, null, 2)}\n`, "utf-8");
+-  return result;
++  return settingsFromRecord(nextSkillful);
+ }
+
+ export async function updateHiddenSkills(
+@@ -247,15 +301,21 @@ export async function updateHiddenSkills(
+     throw new Error("Project skillful settings require a trusted project.");
+   }
+
+-  const path = settingsPath(scope, cwd);
+-  const current = await readSkillfulSettings(path);
+-  return writeHiddenSkills(scope, cwd, updater(current.hiddenSkills), projectTrusted);
++  return updateSkillfulSettings(scope, cwd, projectTrusted, (current) => {
++    current.hiddenSkills = normalizeSkillNames(updater(settingsFromRecord(current).hiddenSkills));
++  });
+ }
+
+ function settingsFromRecord(value: unknown): SkillfulSettings {
++  if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value))) throw new Error("skillful settings must be an object.");
+   const skillful = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
++  for (const key of ["hiddenSkills", "visibleSkills"]) {
++    if (Object.hasOwn(skillful, key) && (!Array.isArray(skillful[key]) || !(skillful[key] as unknown[]).every(item => typeof item === "string"))) throw new Error(`skillful.${key} must be a string array.`);
++  }
+
+   return {
++    visibility: normalizeVisibility(skillful.visibility),
++    visibilityDefaults: normalizeVisibility(skillful.visibilityDefaults, true),
+     hiddenSkills: normalizeSkillNames(stringArray(skillful.hiddenSkills)),
+     hiddenSkillsDefined: Object.hasOwn(skillful, "hiddenSkills"),
+     visibleSkills: normalizeSkillNames(stringArray(skillful.visibleSkills)),
+@@ -274,11 +334,32 @@ function effectiveHiddenSkillSet(scoped: Record<SkillfulScope, SkillfulSettings>
+   return new Set(scoped.project.hiddenSkillsDefined ? scoped.project.hiddenSkills : scoped.global.hiddenSkills);
+ }
+
+-async function unlinkIfExists(path: string): Promise<void> {
+-  try {
+-    await unlink(path);
+-  } catch (error) {
+-    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return;
+-    throw error;
++export function normalizeVisibility(value: unknown, defaults = false): SkillVisibilityMap {
++  if (value === undefined) return {};
++  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Skill visibility must be an object.");
++  const entries = Object.entries(value);
++  if (entries.some(([id, choice]) => !id || !(choice === "show" || choice === "hide" || (!defaults && choice === "inherit")))) throw new Error("Invalid skill visibility choice.");
++  return Object.fromEntries(entries) as SkillVisibilityMap;
++}
++
++/** Modify one identity only, inside the current scope's SDK transaction. */
++export async function updateSkillVisibility(
++  scope: SkillfulScope, cwd: string, id: string, name: string,
++  choice: SkillVisibility, legacyEligible: boolean, projectTrusted = false,
++): Promise<SkillfulSettings> {
++  if (scope === "project" && !/^(hub:skills\/|project:|agent:|home:)/.test(id)) {
++    throw new Error("This external skill has no portable Project identity; use Global instead.");
+   }
++  return updateSkillfulSettings(scope, cwd, projectTrusted, (current) => {
++    if (current.visibility !== undefined && (!current.visibility || typeof current.visibility !== "object" || Array.isArray(current.visibility))) {
++      throw new Error("skillful.visibility must be an object.");
++    }
++    const visibility = { ...(current.visibility as Record<string, unknown> | undefined) };
++    const settings = settingsFromRecord(current);
++    const legacyApplies = legacyEligible && settings.hiddenSkillsDefined;
++    if (choice === "inherit" && !legacyApplies) delete visibility[id];
++    else visibility[id] = choice;
++    if (Object.keys(visibility).length) current.visibility = visibility;
++    else delete current.visibility;
++  });
+ }
+diff --git a/packages/pi-skillful/src/extensions/session-skill-toggles.ts b/packages/pi-skillful/src/extensions/session-skill-toggles.ts
+index 20540fa..b0276b2 100644
+--- a/packages/pi-skillful/src/extensions/session-skill-toggles.ts
++++ b/packages/pi-skillful/src/extensions/session-skill-toggles.ts
+@@ -9,12 +9,12 @@ import type { AutocompleteProvider, EditorComponent, EditorTheme, Focusable, Key
+ import { isFocusable, isKeyRelease, isKeyRepeat, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+ import {
+   DEFAULT_TOGGLE_MODIFIER,
+-  normalizeSkillName,
+   readEffectiveSkillfulSettings,
+   SKILL_TOGGLE_SLOTS,
+   type SkillToggleModifier,
+   type SkillToggleSlot,
+ } from "../config.js";
++import { skillIsHidden, type VisibilitySkill, type ScopedSettings } from "../visibility.js";
+ import { isTopLevelSkill, listLoadedSkills } from "../skills.js";
+
+ const STORE_KEY = Symbol.for("pi-skillful.sessionSkillTogglesStore");
+@@ -33,6 +33,7 @@ interface SessionToggleState {
+   cwd: string;
+   modifier: SkillToggleModifier;
+   hiddenSkills: Set<string>;
++  scoped: ScopedSettings | undefined;
+   slots: ToggleSlotState[];
+   activeBySkill: Map<string, boolean>;
+   installedEditor: boolean;
+@@ -54,8 +55,11 @@ let state: SessionToggleState = createEmptyState();
+
+ export default function sessionSkillToggles(pi: ExtensionAPI) {
+   pi.on("session_start", async (event, ctx) => {
+-    const settings = await readEffectiveSkillfulSettings(ctx.cwd, ctx.isProjectTrusted());
++    let settings;
++    try { settings = await readEffectiveSkillfulSettings(ctx.cwd, ctx.isProjectTrusted()); }
++    catch (error) { ctx.ui.notify(`Cannot read skill visibility: ${String(error)}`, "error"); return; }
+     const slots = configuredToggleSlots(pi, settings.toggleSlots);
++    const hiddenSkills = new Set(listLoadedSkills(pi.getCommands()).filter(skill => skillIsHidden(skill, ctx.cwd, settings.scoped)).map(skill => skill.name));
+
+     const preservedActiveBySkill =
+       event.reason === "new" && store.preservedNewSessionActiveBySkill?.cwd === ctx.cwd
+@@ -66,14 +70,13 @@ export default function sessionSkillToggles(pi: ExtensionAPI) {
+     state = {
+       cwd: ctx.cwd,
+       modifier: settings.toggleModifier,
+-      hiddenSkills: settings.hiddenSkillSet,
++      hiddenSkills,
++      scoped: settings.scoped,
+       slots,
+-      activeBySkill: new Map(
+-        slots.map(({ skillName }) => [
+-          skillName,
+-          preservedActiveBySkill?.get(skillName) ?? !settings.hiddenSkillSet.has(skillName),
+-        ]),
+-      ),
++      activeBySkill: new Map(slots.flatMap(({ skillName }) => {
++        const active = preservedActiveBySkill?.get(skillName);
++        return active === undefined ? [] : [[skillName, active] as [string, boolean]];
++      })),
+       installedEditor: false,
+       previousEditorFactory: undefined,
+       activeTui: undefined,
+@@ -85,13 +88,18 @@ export default function sessionSkillToggles(pi: ExtensionAPI) {
+     refreshUi();
+   });
+
+-  pi.on("before_agent_start", (event) => {
+-    if (state.slots.length === 0 || !event.systemPromptOptions.skills?.length) return;
+-
+-    // Active slots lift only Skillful's own restriction, never frontmatter or
+-    // restrictions already applied by another prompt handler.
++  pi.on("before_agent_start", async (event, ctx) => {
++    if (!event.systemPromptOptions.skills?.length) return;
++    try {
++      const settings = await readEffectiveSkillfulSettings(ctx.cwd, ctx.isProjectTrusted());
++      state.scoped = settings.scoped;
++      state.hiddenSkills = new Set(event.systemPromptOptions.skills.filter(skill => skillIsHidden(skill, ctx.cwd, settings.scoped)).map(skill => skill.name));
++    } catch {
++      // Preserve last good visibility, but never retain a revoked Project layer.
++      if (state.scoped && !ctx.isProjectTrusted()) state.scoped = { ...state.scoped, project: { ...state.scoped.project, visibility: {}, hiddenSkillsDefined: false, visibleSkills: [] } };
++    }
+     event.systemPromptOptions.skills = event.systemPromptOptions.skills.map((skill) =>
+-      isTopLevelSkill(skill) && !isSkillActive(normalizeSkillName(skill.name))
++      state.scoped && sessionSkillIsHidden(skill, ctx.cwd, state.scoped)
+         ? { ...skill, disableModelInvocation: true }
+         : skill,
+     );
+@@ -110,6 +118,7 @@ function createEmptyState(): SessionToggleState {
+     cwd: "",
+     modifier: DEFAULT_TOGGLE_MODIFIER,
+     hiddenSkills: new Set<string>(),
++    scoped: undefined,
+     slots: [],
+     activeBySkill: new Map<string, boolean>(),
+     installedEditor: false,
+@@ -121,7 +130,16 @@ function createEmptyState(): SessionToggleState {
+ }
+
+ export function hasActiveSessionSkillToggles(): boolean {
+-  return state.slots.length > 0;
++  return state.activeBySkill.size > 0;
++}
++
++export function sessionSkillOverride(skillName: string): boolean | undefined {
++  return state.activeBySkill.get(skillName);
++}
++
++export function sessionSkillIsHidden(skill: VisibilitySkill, cwd: string, scoped: ScopedSettings): boolean {
++  const override = state.cwd === cwd && isTopLevelSkill(skill) ? sessionSkillOverride(skill.name) : undefined;
++  return override === undefined ? skillIsHidden(skill, cwd, scoped) : !override;
+ }
+
+ export async function refreshSessionSkillToggles(
+@@ -134,11 +152,13 @@ export async function refreshSessionSkillToggles(
+   const slots = configuredToggleSlots(pi, settings.toggleSlots);
+
+   const previousActiveBySkill = state.activeBySkill;
++  state.cwd = cwd;
++  state.scoped = settings.scoped;
+   state.modifier = settings.toggleModifier;
+-  state.hiddenSkills = settings.hiddenSkillSet;
++  state.hiddenSkills = new Set(listLoadedSkills(pi.getCommands()).filter(skill => skillIsHidden(skill, cwd, settings.scoped)).map(skill => skill.name));
+   state.slots = slots;
+   state.activeBySkill = new Map(
+-    slots.map(({ skillName }) => [skillName, previousActiveBySkill.get(skillName) ?? !settings.hiddenSkillSet.has(skillName)]),
++    slots.flatMap(({ skillName }) => previousActiveBySkill.has(skillName) ? [[skillName, previousActiveBySkill.get(skillName)!] as [string, boolean]] : []),
+   );
+
+   if (slots.length > 0 && !state.installedEditor) {
+@@ -234,8 +254,11 @@ function hasCustomEditorHooks(editor: EditorComponent): editor is EditorComponen
+
+ class SkillToggleEditorWrapper implements EditorComponent, Focusable {
+   private _focused = false;
++  private readonly inner: EditorComponent;
+
+-  constructor(private readonly inner: EditorComponent) {}
++  constructor(inner: EditorComponent) {
++    this.inner = inner;
++  }
+
+   get borderColor(): ((str: string) => string) | undefined {
+     return this.inner.borderColor?.bind(this.inner);
+diff --git a/packages/pi-skillful/src/extensions/skill-visibility.ts b/packages/pi-skillful/src/extensions/skill-visibility.ts
+index c6cc9c2..0bc883b 100644
+--- a/packages/pi-skillful/src/extensions/skill-visibility.ts
++++ b/packages/pi-skillful/src/extensions/skill-visibility.ts
+@@ -10,25 +10,24 @@ import {
+ import { type Component, Key, matchesKey, type SettingItem, SettingsList, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
+ import {
+   normalizeSkillName,
+-  normalizeSkillNames,
+-  readEffectiveHiddenSkills,
+   readScopedSkillfulSettings,
+   SKILL_TOGGLE_SLOTS,
+   type SkillfulScope,
+   type SkillToggleSlot,
+-  writeHiddenSkills,
+-  writeProjectSkillfulOverride,
+-  writeToggleSlots,
++  type SkillVisibility,
++  updateSkillVisibility,
++  updateToggleSlots,
+ } from "../config.js";
+ import { isTopLevelSkill, listLoadedSkills, type LoadedSkillInfo } from "../skills.js";
+-import { hasActiveSessionSkillToggles, refreshSessionSkillToggles } from "./session-skill-toggles.js";
++import { scopedSkillChoice, skillVisibilityId, visibilityEligible, type ScopedSettings } from "../visibility.js";
++import { sessionSkillIsHidden, refreshSessionSkillToggles } from "./session-skill-toggles.js";
+ const SCOPES: SkillfulScope[] = ["global", "project"];
+ const STORE_KEY = Symbol.for("pi-skillful.skillVisibilityStore");
+ // Install the new component contract even after reloading a V3-patched process.
+-const STARTUP_PATCH_KEY = Symbol.for("pi-skillful.startupPatchV4");
++const STARTUP_PATCH_KEY = Symbol.for("pi-skillful.startupPatchV5");
+
+ interface SkillVisibilityStore {
+-  hiddenSkillsByCwd: Map<string, Set<string>>;
++  scopedByCwd?: Map<string, ScopedSettings>;
+   theme: Theme | null;
+   getTheme?: () => Theme;
+ }
+@@ -53,23 +52,15 @@ interface InteractiveModeLike {
+ }
+
+ const store = (((globalThis as Record<PropertyKey, unknown>)[STORE_KEY] as SkillVisibilityStore | undefined) ??= {
+-  hiddenSkillsByCwd: new Map<string, Set<string>>(),
+   theme: null,
+ }) as SkillVisibilityStore;
+
+ type SkillListItem = LoadedSkillInfo;
+-type HiddenSkillsByScope = Record<SkillfulScope, Set<string>>;
+-type ToggleSlotsByScope = Record<SkillfulScope, Partial<Record<SkillToggleSlot, string>>>;
+-type DefinedByScope = Record<SkillfulScope, boolean>;
+-
+ interface SkillfulVisibilityMenuOptions {
+   cwd: string;
+   projectTrusted: boolean;
+   skills: SkillListItem[];
+-  hiddenByScope: HiddenSkillsByScope;
+-  hiddenSkillsDefinedByScope: DefinedByScope;
+-  toggleSlotsByScope: ToggleSlotsByScope;
+-  toggleSlotsDefinedByScope: DefinedByScope;
++  scoped: ScopedSettings;
+   theme: Theme;
+   tui: TUI;
+   notify: (message: string, type?: "info" | "warning" | "error") => void;
+@@ -94,14 +85,12 @@ export default function skillVisibility(pi: ExtensionAPI) {
+   });
+
+   pi.on("before_agent_start", async (event, ctx) => {
+-    if (hasActiveSessionSkillToggles()) return;
+-
+-    const hidden = await refreshHiddenSkillCache(ctx.cwd, ctx.isProjectTrusted());
+-    if (hidden.size === 0 || !event.systemPromptOptions.skills?.length) return;
+-
+-    event.systemPromptOptions.skills = event.systemPromptOptions.skills.map((skill) =>
+-      isTopLevelSkill(skill) && hidden.has(skill.name) ? { ...skill, disableModelInvocation: true } : skill,
+-    );
++    const scoped = await refreshHiddenSkillCache(ctx.cwd, ctx.isProjectTrusted());
++    if (!scoped || !event.systemPromptOptions.skills?.length) return;
++    event.systemPromptOptions.skills = event.systemPromptOptions.skills.map((skill) => {
++      const hidden = sessionSkillIsHidden(skill, ctx.cwd, scoped);
++      return hidden ? { ...skill, disableModelInvocation: true } : skill;
++    });
+   });
+
+   pi.registerCommand("skillful", {
+@@ -112,35 +101,22 @@ export default function skillVisibility(pi: ExtensionAPI) {
+         return;
+       }
+
+-      const skills = getSkillItems(pi);
++      const skills = getSkillItems(pi, ctx.cwd);
+       if (skills.length === 0) {
+         ctx.ui.notify("No skills are currently loaded.", "info");
+         return;
+       }
+
+       const projectTrusted = ctx.isProjectTrusted();
+-      const scoped = await readScopedSkillfulSettings(ctx.cwd, projectTrusted);
++      let scoped: ScopedSettings;
++      try { scoped = await readScopedSkillfulSettings(ctx.cwd, projectTrusted); }
++      catch (error) { ctx.ui.notify(`Cannot read skill visibility: ${String(error)}`, "error"); return; }
+       await ctx.ui.custom<void>((tui, theme, _keybindings, done) =>
+         new SkillfulVisibilityMenu({
+           cwd: ctx.cwd,
+           projectTrusted,
+           skills,
+-          hiddenByScope: {
+-            global: new Set(scoped.global.hiddenSkills),
+-            project: new Set(scoped.project.hiddenSkills),
+-          },
+-          hiddenSkillsDefinedByScope: {
+-            global: scoped.global.hiddenSkillsDefined,
+-            project: scoped.project.hiddenSkillsDefined,
+-          },
+-          toggleSlotsByScope: {
+-            global: { ...scoped.global.toggleSlots },
+-            project: { ...scoped.project.toggleSlots },
+-          },
+-          toggleSlotsDefinedByScope: {
+-            global: scoped.global.toggleSlotsDefined,
+-            project: scoped.project.toggleSlotsDefined,
+-          },
++          scoped,
+           theme,
+           tui,
+           notify: (message, type) => ctx.ui.notify(message, type),
+@@ -152,10 +128,22 @@ export default function skillVisibility(pi: ExtensionAPI) {
+   });
+ }
+
+-async function refreshHiddenSkillCache(cwd: string, projectTrusted: boolean): Promise<Set<string>> {
+-  const hidden = await readEffectiveHiddenSkills(cwd, projectTrusted);
+-  store.hiddenSkillsByCwd.set(cwd, hidden);
+-  return hidden;
++async function refreshHiddenSkillCache(cwd: string, projectTrusted: boolean): Promise<ScopedSettings | undefined> {
++  store.scopedByCwd ??= new Map();
++  try {
++    const scoped = await readScopedSkillfulSettings(cwd, projectTrusted);
++    store.scopedByCwd.set(cwd, scoped);
++    return scoped;
++  } catch {
++    // A partial/invalid settings write must not unhide the last good selection.
++    const previous = store.scopedByCwd.get(cwd);
++    if (previous && !projectTrusted) {
++      const safe = { ...previous, project: { ...previous.project, visibility: {}, hiddenSkillsDefined: false, visibleSkills: [] } };
++      store.scopedByCwd.set(cwd, safe);
++      return safe;
++    }
++    return previous;
++  }
+ }
+
+ // Pi has no public hook for styling the built-in startup resource list, so patch the
+@@ -180,9 +168,11 @@ export function installStartupSkillListPatch(
+     }
+
+     const cwd = this.sessionManager?.getCwd?.();
++    let rawSkills: Skill[] = [];
+     let rawSkillNames: string[] = [];
+     loader.getSkills = () => {
+       const result = originalGetSkills.call(loader);
++      rawSkills = result.skills;
+       rawSkillNames = result.skills.map((skill) => normalizeSkillName(skill.name));
+       return result;
+     };
+@@ -197,7 +187,10 @@ export function installStartupSkillListPatch(
+
+     const colorized = () => buildColorizedSkillList(
+       rawSkillNames,
+-      store.hiddenSkillsByCwd.get(cwd) ?? new Set<string>(),
++      new Set(rawSkills.filter(skill => {
++        const scoped = store.scopedByCwd?.get(cwd);
++        return !!scoped && sessionSkillIsHidden(skill, cwd, scoped);
++      }).map(skill => skill.name)),
+       store.getTheme?.() ?? store.theme,
+     );
+     const collapsedText = buildColorizedSkillList(rawSkillNames, new Set(), null);
+@@ -241,8 +234,8 @@ export function buildColorizedSkillList(names: string[], hidden: Set<string>, th
+   return `${header}\n  ${parts.join(", ")}`;
+ }
+
+-function getSkillItems(pi: ExtensionAPI): SkillListItem[] {
+-  return listLoadedSkills(pi.getCommands()).filter(isTopLevelSkill);
++function getSkillItems(pi: ExtensionAPI, cwd: string): SkillListItem[] {
++  return listLoadedSkills(pi.getCommands()).filter(skill => visibilityEligible(skill, cwd));
+ }
+
+ class SkillfulVisibilityMenu implements Component {
+@@ -250,10 +243,7 @@ class SkillfulVisibilityMenu implements Component {
+   private readonly projectTrusted: boolean;
+   private readonly scopes: SkillfulScope[];
+   private readonly skills: SkillListItem[];
+-  private readonly hiddenByScope: HiddenSkillsByScope;
+-  private readonly hiddenSkillsDefinedByScope: DefinedByScope;
+-  private readonly toggleSlotsByScope: ToggleSlotsByScope;
+-  private readonly toggleSlotsDefinedByScope: DefinedByScope;
++  private scoped: ScopedSettings;
+   private readonly theme: Theme;
+   private readonly tui: TUI;
+   private readonly notify: (message: string, type?: "info" | "warning" | "error") => void;
+@@ -271,10 +261,7 @@ class SkillfulVisibilityMenu implements Component {
+     this.scopes = options.projectTrusted ? SCOPES : ["global"];
+     this.scope = options.projectTrusted ? "project" : "global";
+     this.skills = options.skills;
+-    this.hiddenByScope = options.hiddenByScope;
+-    this.hiddenSkillsDefinedByScope = options.hiddenSkillsDefinedByScope;
+-    this.toggleSlotsByScope = options.toggleSlotsByScope;
+-    this.toggleSlotsDefinedByScope = options.toggleSlotsDefinedByScope;
++    this.scoped = options.scoped;
+     this.theme = options.theme;
+     this.tui = options.tui;
+     this.notify = options.notify;
+@@ -286,6 +273,7 @@ class SkillfulVisibilityMenu implements Component {
+   }
+
+   render(width: number): string[] {
++    this.refreshItemDetails();
+     return [
+       ...this.topBorder.render(width),
+       truncateToWidth(`  ${this.theme.bold(this.theme.fg("accent", "pi-skillful"))}  ${this.renderTabs()}`, width),
+@@ -335,7 +323,7 @@ class SkillfulVisibilityMenu implements Component {
+
+   private renderHelp(): string {
+     const scopeHelp = this.projectTrusted ? "Tab/←/→ switch scope · " : "";
+-    return `  ${scopeHelp}1-9 assign/clear toggle · Enter/Space on/off · Esc close`;
++    return `  ${scopeHelp}1-9 assign/clear toggle · Enter/Space show/hide/inherit · Esc close`;
+   }
+
+   private switchScope(direction: 1 | -1): void {
+@@ -347,13 +335,12 @@ class SkillfulVisibilityMenu implements Component {
+
+   private createSettingsList(): SettingsList {
+     const items: SettingItem[] = this.skills.map((skill) => {
+-      const hidden = this.isHidden(this.scope, skill.name);
+       return {
+         id: skill.name,
+         label: skill.name,
+-        description: `${skill.description || "No skill description provided."}\nPress 1-9 to assign or clear this skill's toggle slot in the ${this.scope} scope.`,
+-        currentValue: this.skillValue(skill.name, hidden),
+-        values: [this.skillValue(skill.name, false), this.skillValue(skill.name, true)],
++        description: this.skillDescription(skill),
++        currentValue: this.skillValue(skill.name),
++        values: ["show", "hide", "inherit"],
+       };
+     });
+
+@@ -362,88 +349,81 @@ class SkillfulVisibilityMenu implements Component {
+       12,
+       getSettingsListTheme(),
+       (id, newValue) => {
+-        this.setHidden(this.scope, id, newValue.includes("off"));
+-        this.settingsList.updateValue(id, this.skillValue(id, this.isHidden(this.scope, id)));
+-        this.persistScope(this.scope);
++        const choice = newValue.trim().split(/\s+/)[0] as SkillVisibility;
++        const skill = this.skills.find(skill => skill.name === id)!;
++        const identity = skillVisibilityId(skill, this.scope, this.cwd);
++        if (!identity) {
++          this.notify("This external skill has no portable Project identity; use Global instead.", "warning");
++          this.settingsList.updateValue(id, this.skillValue(id));
++          return;
++        }
++        this.settingsList.updateValue(id, choice);
++        this.persistScope(this.scope, skill, identity, choice);
+       },
+       () => this.close(),
+       { enableSearch: true },
+     );
+   }
+
+-  private isHidden(scope: SkillfulScope, skillName: string): boolean {
+-    if (scope === "project" && !this.hiddenSkillsDefinedByScope.project) return this.hiddenByScope.global.has(skillName);
+-    return this.hiddenByScope[scope].has(skillName);
++  private skillDescription(skill: SkillListItem): string {
++    return `${skill.description || "No skill description provided."}\nEffective: ${sessionSkillIsHidden(skill, this.cwd, this.scoped) ? "hide" : "show"} (Pi manual-only restrictions remain).${isTopLevelSkill(skill) ? " Press 1-9 to assign/clear a toggle slot." : " Public package skill; no new shortcut slots."}`;
+   }
+
+-  private setHidden(scope: SkillfulScope, skillName: string, hidden: boolean): void {
+-    const hiddenSkills = scope === "project" ? this.ensureFullProjectOverride().hiddenSkills : this.ensureWritableHiddenSkills(scope);
+-    if (hidden) hiddenSkills.add(skillName);
+-    else hiddenSkills.delete(skillName);
+-  }
+-
+-  private ensureWritableHiddenSkills(scope: SkillfulScope): Set<string> {
+-    if (scope === "global") this.hiddenSkillsDefinedByScope.global = true;
+-    return this.hiddenByScope[scope];
+-  }
+-
+-  private ensureFullProjectOverride(): { hiddenSkills: Set<string>; toggleSlots: Partial<Record<SkillToggleSlot, string>> } {
+-    if (!this.hiddenSkillsDefinedByScope.project) {
+-      this.hiddenByScope.project = new Set(this.hiddenByScope.global);
+-      this.hiddenSkillsDefinedByScope.project = true;
+-    }
+-    if (!this.toggleSlotsDefinedByScope.project) {
+-      this.toggleSlotsByScope.project = { ...this.toggleSlotsByScope.global };
+-      this.toggleSlotsDefinedByScope.project = true;
++  private refreshItemDetails(): void {
++    const list = this.settingsList as unknown as SettingsListSelectionView;
++    for (const item of list.items ?? []) {
++      const skill = this.skills.find(skill => skill.name === item.id)!;
++      const slot = isTopLevelSkill(skill) ? SKILL_TOGGLE_SLOTS.find(candidate => this.currentToggleSlots()[candidate] === skill.name) : undefined;
++      item.label = `${skill.name}${slot ? ` [${slot}]` : ""}`;
++      item.description = this.skillDescription(skill);
+     }
+-    return { hiddenSkills: this.hiddenByScope.project, toggleSlots: this.toggleSlotsByScope.project };
+   }
+
+-  private skillValue(skillName: string, hidden: boolean): string {
+-    const slot = SKILL_TOGGLE_SLOTS.find((candidate) => this.currentToggleSlots()[candidate] === skillName) ?? "";
+-    const status = (hidden ? "off" : "on").padEnd(3, " ");
+-    const statusText = this.isProjectOverride(skillName) ? this.theme.fg("accent", status) : status;
+-    return `${statusText}   ${slot}`;
++  private skillValue(skillName: string): string {
++    const skill = this.skills.find(skill => skill.name === skillName)!;
++    return scopedSkillChoice(skill, this.scope, this.cwd, this.scoped);
+   }
+
+   private currentToggleSlots(): Partial<Record<SkillToggleSlot, string>> {
+-    if (this.scope === "project" && !this.toggleSlotsDefinedByScope.project) return this.toggleSlotsByScope.global;
+-    return this.toggleSlotsByScope[this.scope];
++    if (this.scope === "project" && !this.scoped.project.toggleSlotsDefined) return this.scoped.global.toggleSlots;
++    return this.scoped[this.scope].toggleSlots;
+   }
+
+   private ensureWritableToggleSlots(scope: SkillfulScope): Partial<Record<SkillToggleSlot, string>> {
+-    if (scope === "project") return this.ensureFullProjectOverride().toggleSlots;
+-    this.toggleSlotsDefinedByScope.global = true;
+-    return this.toggleSlotsByScope.global;
+-  }
+-
+-  private isProjectOverride(skillName: string): boolean {
+-    if (this.scope !== "project") return false;
+-    return this.isHidden("project", skillName) !== this.isHidden("global", skillName);
++    if (scope === "project" && !this.scoped.project.toggleSlotsDefined) {
++      this.scoped.project.toggleSlots = { ...this.scoped.global.toggleSlots };
++    }
++    this.scoped[scope].toggleSlotsDefined = true;
++    return this.scoped[scope].toggleSlots;
+   }
+
+   private toggleSelectedSkillSlot(slot: SkillToggleSlot): void {
+     const skillName = this.selectedSkillName();
+-    if (!skillName) return;
++    if (!skillName || !isTopLevelSkill(this.skills.find(skill => skill.name === skillName)!)) return;
+
+     const toggleSlots = this.ensureWritableToggleSlots(this.scope);
+     const affected = new Set<string>([skillName]);
+     const previousSkill = toggleSlots[slot];
+     if (previousSkill) affected.add(previousSkill);
+
+-    if (previousSkill === skillName) {
+-      delete toggleSlots[slot];
+-    } else {
+-      for (const candidate of SKILL_TOGGLE_SLOTS) {
+-        if (toggleSlots[candidate] === skillName) delete toggleSlots[candidate];
++    const clear = previousSkill === skillName;
++    const changeSlot = (current: Partial<Record<SkillToggleSlot, string>>) => {
++      if (clear) {
++        if (current[slot] === skillName) delete current[slot];
++      } else {
++        for (const candidate of SKILL_TOGGLE_SLOTS) {
++          if (current[candidate] === skillName) delete current[candidate];
++        }
++        current[slot] = skillName;
+       }
+-      toggleSlots[slot] = skillName;
+-    }
++      return current;
++    };
++    changeSlot(toggleSlots);
+
+     for (const affectedSkill of affected) {
+-      this.settingsList.updateValue(affectedSkill, this.skillValue(affectedSkill, this.isHidden(this.scope, affectedSkill)));
++      if (this.skills.some(skill => skill.name === affectedSkill)) this.settingsList.updateValue(affectedSkill, this.skillValue(affectedSkill));
+     }
+-    this.persistToggleSlots(this.scope);
++    this.persistToggleSlots(this.scope, changeSlot);
+     this.tui.requestRender();
+   }
+
+@@ -455,27 +435,30 @@ class SkillfulVisibilityMenu implements Component {
+     return items[selectedIndex]?.id;
+   }
+
+-  private persistScope(scope: SkillfulScope): void {
+-    const hiddenSnapshot = normalizeSkillNames(this.hiddenByScope[scope]);
+-    this.saveQueue = this.saveQueue
+-      .catch(() => undefined)
+-      .then(async () => {
+-        if (scope === "project") await this.writeProjectOverrideOrInheritance();
+-        else await writeHiddenSkills(scope, this.cwd, hiddenSnapshot);
+-        await refreshHiddenSkillCache(this.cwd, this.projectTrusted);
+-      })
+-      .catch((error) => {
+-        this.notify(`Failed to save ${scope} skill visibility: ${error instanceof Error ? error.message : String(error)}`, "error");
+-      });
++  private persistScope(scope: SkillfulScope, skill: SkillListItem, identity: string, choice: SkillVisibility): void {
++    this.saveQueue = this.saveQueue.catch(() => undefined).then(async () => {
++      await updateSkillVisibility(scope, this.cwd, identity, skill.name, choice, isTopLevelSkill(skill), this.projectTrusted);
++      const scoped = await refreshHiddenSkillCache(this.cwd, this.projectTrusted);
++      if (scoped) this.scoped = scoped;
++      this.settingsList.updateValue(skill.name, this.skillValue(skill.name));
++      this.tui.requestRender();
++    }).catch(error => {
++      this.notify(`Failed to save ${scope} skill visibility: ${String(error)}`, "error");
++      this.settingsList.updateValue(skill.name, this.skillValue(skill.name));
++      this.tui.requestRender();
++    });
+   }
+
+-  private persistToggleSlots(scope: SkillfulScope): void {
+-    const snapshot = { ...this.toggleSlotsByScope[scope] };
++  private persistToggleSlots(
++    scope: SkillfulScope,
++    update: (current: Partial<Record<SkillToggleSlot, string>>) => Partial<Record<SkillToggleSlot, string>>,
++  ): void {
+     this.saveQueue = this.saveQueue
+       .catch(() => undefined)
+       .then(async () => {
+-        if (scope === "project") await this.writeProjectOverrideOrInheritance();
+-        else await writeToggleSlots(scope, this.cwd, snapshot);
++        await updateToggleSlots(scope, this.cwd, update, this.projectTrusted);
++        this.scoped = await readScopedSkillfulSettings(this.cwd, this.projectTrusted);
++        this.tui.requestRender();
+       })
+       .catch((error) => {
+         this.notify(`Failed to save ${scope} skill toggles: ${error instanceof Error ? error.message : String(error)}`, "error");
+@@ -492,43 +475,4 @@ class SkillfulVisibilityMenu implements Component {
+       .finally(() => this.done());
+   }
+
+-  private async writeProjectOverrideOrInheritance(): Promise<void> {
+-    if (this.projectMatchesGlobal()) {
+-      this.hiddenSkillsDefinedByScope.project = false;
+-      this.toggleSlotsDefinedByScope.project = false;
+-      await writeProjectSkillfulOverride(this.cwd, undefined, undefined, this.projectTrusted);
+-      return;
+-    }
+-
+-    this.hiddenSkillsDefinedByScope.project = true;
+-    this.toggleSlotsDefinedByScope.project = true;
+-    await writeProjectSkillfulOverride(
+-      this.cwd,
+-      this.hiddenByScope.project,
+-      this.toggleSlotsByScope.project,
+-      this.projectTrusted,
+-    );
+-  }
+-
+-  private projectMatchesGlobal(): boolean {
+-    return setsEqual(this.hiddenByScope.project, this.hiddenByScope.global) && toggleSlotsEqual(this.toggleSlotsByScope.project, this.toggleSlotsByScope.global);
+-  }
+-}
+-
+-function setsEqual(a: Set<string>, b: Set<string>): boolean {
+-  if (a.size !== b.size) return false;
+-  for (const value of a) {
+-    if (!b.has(value)) return false;
+-  }
+-  return true;
+-}
+-
+-function toggleSlotsEqual(
+-  a: Partial<Record<SkillToggleSlot, string>>,
+-  b: Partial<Record<SkillToggleSlot, string>>,
+-): boolean {
+-  for (const slot of SKILL_TOGGLE_SLOTS) {
+-    if (a[slot] !== b[slot]) return false;
+-  }
+-  return true;
+ }
+diff --git a/packages/pi-skillful/src/install-telemetry.ts b/packages/pi-skillful/src/install-telemetry.ts
+index 01fbb0b..7519f10 100644
+--- a/packages/pi-skillful/src/install-telemetry.ts
++++ b/packages/pi-skillful/src/install-telemetry.ts
+@@ -1,7 +1,6 @@
+ import { readFileSync } from "node:fs";
+ import { join } from "node:path";
+ import { fileURLToPath } from "node:url";
+-import { reportInstallTelemetry as report } from "@mocito/install-telemetry";
+ import { getAgentDir } from "@earendil-works/pi-coding-agent";
+
+ const PACKAGE_NAME = "pi-skillful";
+@@ -62,16 +61,27 @@ function getPackageVersion(): string {
+   return typeof packageJson.version === "string" && packageJson.version.length > 0 ? packageJson.version : "0.0.0";
+ }
+
+-export function reportInstallTelemetry(): void {
++export async function reportInstallTelemetry(): Promise<void> {
++  if (!isInstallTelemetryEnabled()) return;
++  let telemetry: typeof import("@mocito/install-telemetry");
+   try {
+-    void report({
++    telemetry = await import("@mocito/install-telemetry");
++  } catch (error) {
++    // Local Pi packages have no automatic dependency installation.
++    if (error && typeof error === "object" && "code" in error &&
++        (error.code === "ERR_MODULE_NOT_FOUND" || error.code === "MODULE_NOT_FOUND") &&
++        "message" in error && /^Cannot find (?:package|module) ['"]@mocito\/install-telemetry['"]/.test(String(error.message))) return;
++    throw error;
++  }
++  try {
++    void telemetry.reportInstallTelemetry({
+       endpoint: INSTALL_TELEMETRY_ENDPOINT,
+       tool: PACKAGE_NAME,
+       version: getPackageVersion(),
+       statePath: join(getAgentDir(), "extensions", "skillful-install.json"),
+-      enabled: isInstallTelemetryEnabled(),
++      enabled: true,
+     }).catch(() => undefined);
+   } catch {
+-    // Best-effort telemetry: ignore local policy and filesystem failures.
++    // Preserve upstream's best-effort reporting without delaying skill registration.
+   }
+ }
+diff --git a/packages/pi-skillful/src/visibility.ts b/packages/pi-skillful/src/visibility.ts
+new file mode 100644
+index 0000000..c69f1ab
+--- /dev/null
++++ b/packages/pi-skillful/src/visibility.ts
+@@ -0,0 +1,105 @@
++import { existsSync, readFileSync, realpathSync } from "node:fs";
++import { homedir } from "node:os";
++import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
++import { fileURLToPath } from "node:url";
++import { getAgentDir, type SourceInfo } from "@earendil-works/pi-coding-agent";
++import type { SkillfulScope, SkillfulSettings, SkillVisibility } from "./config.js";
++
++export interface VisibilitySkill {
++  name: string;
++  sourceInfo: SourceInfo;
++  disableModelInvocation?: boolean;
++}
++export type ScopedSettings = Record<SkillfulScope, SkillfulSettings>;
++
++function canonical(path: string): string {
++  try { return realpathSync(path); } catch { return resolve(path); }
++}
++function inside(root: string, path: string): string | undefined {
++  const value = relative(root, path);
++  return value && value !== ".." && !value.startsWith(`..${sep}`) && !isAbsolute(value) ? value.split(sep).join("/") : undefined;
++}
++
++function localHubRoots(): Set<string> {
++  const roots = new Set<string>();
++  try {
++    const marker = JSON.parse(readFileSync(join(getAgentDir(), "machine.json"), "utf-8"));
++    if (typeof marker.hubRepoPath === "string" && isAbsolute(marker.hubRepoPath) && existsSync(marker.hubRepoPath)) roots.add(canonical(marker.hubRepoPath));
++  } catch { /* Missing or invalid machine metadata does not authorize a path. */ }
++  // Also recognize a published repository copy when this package is loaded
++  // directly from its managed packages/pi-skillful subtree (including tests).
++  let directory = dirname(fileURLToPath(import.meta.url));
++  while (dirname(directory) !== directory) {
++    if (directory.endsWith(`${sep}packages${sep}pi-skillful`)) {
++      roots.add(canonical(join(directory, "../..")));
++      break;
++    }
++    directory = dirname(directory);
++  }
++  return roots;
++}
++
++/** A name or a skills/ substring is not package provenance. Both the loaded
++ * SourceInfo source and real resource containment must identify this hub. */
++export function publicSkillId(skill: VisibilitySkill, cwd: string): string | undefined {
++  const info = skill.sourceInfo;
++  if (info.origin !== "package" || !existsSync(info.path)) return undefined;
++  const source = info.source;
++  let root: string;
++  if (/^git:(?:https:\/\/)?github\.com\/nzh10\/nzh10-skills(?:\.git)?(?:@[^\s]+)?$/.test(source)) {
++    root = canonical(join(info.scope === "project" ? join(cwd, ".pi") : getAgentDir(), "git/github.com/nzh10/nzh10-skills"));
++  } else {
++    if (!source || /^(npm:|git:|https?:)/.test(source) || source === "auto" || source === "local") return undefined;
++    const expanded = source.startsWith("~/") ? join(homedir(), source.slice(2)) : source;
++    root = canonical(resolve(info.scope === "project" ? join(cwd, ".pi") : getAgentDir(), expanded));
++    if (!localHubRoots().has(root)) return undefined;
++  }
++  if (!existsSync(join(root, "canon/settings.canon.json")) || !existsSync(join(root, "upstreams/pi-skillful.json"))) return undefined;
++  const path = canonical(info.path);
++  const resource = inside(root, path);
++  if (!resource || !/^skills\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.md$/.test(resource)) return undefined;
++  return `hub:${resource}`;
++}
++
++export function visibilityEligible(skill: VisibilitySkill, cwd: string): boolean {
++  return skill.sourceInfo.origin === "top-level" || publicSkillId(skill, cwd) !== undefined;
++}
++
++/** Global local identities never enter the shareable Project document. */
++export function skillVisibilityId(skill: VisibilitySkill, scope: SkillfulScope, cwd: string): string | undefined {
++  const publicId = publicSkillId(skill, cwd);
++  if (publicId) return publicId;
++  if (skill.sourceInfo.origin !== "top-level" || !skill.sourceInfo.path) return undefined;
++  const path = canonical(skill.sourceInfo.path);
++  const projectPath = inside(canonical(cwd), path);
++  if (scope === "project" && projectPath) return `project:${projectPath}`;
++  if (scope === "global" && skill.sourceInfo.scope === "project") return `file:${path}`;
++  const agentPath = inside(canonical(getAgentDir()), path);
++  if (agentPath) return `agent:${agentPath}`;
++  const homePath = inside(canonical(homedir()), path);
++  if (homePath) return `home:${homePath}`;
++  return scope === "global" ? `file:${path}` : undefined;
++}
++
++function legacyChoice(settings: SkillfulSettings, name: string): SkillVisibility | undefined {
++  if (settings.hiddenSkillsDefined) return settings.hiddenSkills.includes(name) ? "hide" : "show";
++  return undefined;
++}
++
++export function scopedSkillChoice(skill: VisibilitySkill, scope: SkillfulScope, cwd: string, settings: ScopedSettings): SkillVisibility {
++  const id = skillVisibilityId(skill, scope, cwd);
++  const modern = id ? settings[scope].visibility[id] : undefined;
++  return modern ?? (skill.sourceInfo.origin === "top-level" ? legacyChoice(settings[scope], skill.name) : undefined) ?? "inherit";
++}
++
++/** Project > Global > steward's canon projection > Pi. 'show' removes only
++ * Skillful's restriction: callers never clear disableModelInvocation. */
++export function skillIsHidden(skill: VisibilitySkill, cwd: string, settings: ScopedSettings): boolean {
++  if (!visibilityEligible(skill, cwd)) return false;
++  for (const scope of ["project", "global"] as const) {
++    const choice = scopedSkillChoice(skill, scope, cwd, settings);
++    if (choice !== "inherit") return choice === "hide";
++  }
++  const id = skillVisibilityId(skill, "global", cwd);
++  return !!id && settings.global.visibilityDefaults[id] === "hide";
++}
+diff --git a/packages/pi-skillful/tests/session-skill-toggles.test.mjs b/packages/pi-skillful/tests/session-skill-toggles.test.mjs
+index 8941c0c..dc1adf9 100644
+--- a/packages/pi-skillful/tests/session-skill-toggles.test.mjs
++++ b/packages/pi-skillful/tests/session-skill-toggles.test.mjs
+@@ -262,26 +262,55 @@ test("prompt toggles change only owned structured visibility and never clear an
+   const skills = commands.map((command, index) => ({
+     name: command.name.slice("skill:".length), sourceInfo: command.sourceInfo, disableModelInvocation: index === 2,
+   }));
+-  const apply = () => {
++  const apply = async () => {
+     const event = { systemPromptOptions: { skills, forceSystemPrompt: "Explicit policy." } };
+-    assert.equal(harness.handlers.get("before_agent_start")(event), undefined);
++    assert.equal(await harness.handlers.get("before_agent_start")(event, ctx), undefined);
+     assert.equal(event.systemPromptOptions.forceSystemPrompt, "Explicit policy.");
+     return event.systemPromptOptions.skills;
+   };
+   try {
+-    assert.deepEqual(apply().map(skill => skill.disableModelInvocation), [true, false, true]);
++    assert.deepEqual((await apply()).map(skill => skill.disableModelInvocation), [true, false, true]);
+     const editor = harness.createInstalledEditor();
+     editor.handleInput("\x1b1");
+     const notifications = harness.notifications.length;
+     editor.handleInput("\x1b2");
+     assert.equal(harness.notifications.length, notifications, "bundled skills have no toggle slot");
+-    assert.deepEqual(apply().map(skill => skill.disableModelInvocation), [false, false, true]);
++    assert.deepEqual((await apply()).map(skill => skill.disableModelInvocation), [false, false, true]);
+     assert.equal(skills[0].disableModelInvocation, false, "resource-loader skills remain unchanged");
+   } finally {
+     await shutdown(harness, ctx);
+   }
+ });
+
++test("configured but unpressed slots follow current per-item settings; pressed shortcuts alone override", async () => {
++  const cwd = await mkdtemp(join(home, "modern-slot-"));
++  const command = skillCommand("modern-slot");
++  const { skillVisibilityId } = await import("../.test-dist/src/visibility.js");
++  const resource = { name: "modern-slot", sourceInfo: command.sourceInfo };
++  const id = skillVisibilityId(resource, "global", cwd);
++  await writeGlobal({ visibility: { [id]: "show" }, toggleSlots: { 1: "modern-slot" } });
++  const harness = createHarness({ commands: [command], previousEditor: createEditor() });
++  const ctx = await start(harness, cwd, false);
++  const apply = async (restricted = false) => {
++    const event = { systemPromptOptions: { skills: [{ ...resource, disableModelInvocation: restricted }] } };
++    await harness.handlers.get("before_agent_start")(event, ctx);
++    return event.systemPromptOptions.skills[0].disableModelInvocation;
++  };
++  try {
++    assert.equal(await apply(), false);
++    await writeGlobal({ visibility: { [id]: "hide" }, toggleSlots: { 1: "modern-slot" } });
++    assert.equal(await apply(), true, "unpressed slot must not freeze startup visibility");
++    const editor = harness.createInstalledEditor();
++    editor.handleInput("\x1b1");
++    assert.equal(await apply(), false, "real press temporarily lifts only Skillful hide");
++    assert.equal(await apply(true), true, "Pi/other extensions' manual-only restriction remains");
++    await writeGlobal({ visibility: { [id]: "show" }, toggleSlots: { 1: "modern-slot" } });
++    await refreshSessionSkillToggles(harness.pi, cwd, false, harness.ui);
++    editor.handleInput("\x1b1");
++    assert.equal(await apply(), true, "pressed inactive slot overrides persistent show");
++  } finally { await shutdown(harness, ctx); }
++});
++
+ test("existing toggle border reads the current theme and fits tiny/wide resize widths", async () => {
+   await writeGlobal({ toggleSlots: { 1: "界-🦊" } });
+   const inner = createEditor({ focusable: true });
+diff --git a/packages/pi-skillful/tests/skill-visibility.test.mjs b/packages/pi-skillful/tests/skill-visibility.test.mjs
+index fcfd97d..33357ff 100644
+--- a/packages/pi-skillful/tests/skill-visibility.test.mjs
++++ b/packages/pi-skillful/tests/skill-visibility.test.mjs
+@@ -178,6 +178,78 @@ test("untrusted projects expose only global settings in the menu", async () => {
+   assert.deepEqual(JSON.parse(await readFile(projectPath, "utf-8")), projectSettings);
+ });
+
++test("public package menu, prompt and startup markers share tri-state qualification without new slots", async () => {
++  const cwd = await mkdtemp(join(home, "public-menu-"));
++  const hub = join(cwd, "hub");
++  const publicPath = join(hub, "skills/public/SKILL.md");
++  await writeSettings(join(home, ".pi/agent/machine.json"), { hubRepoPath: hub });
++  await writeSettings(join(hub, "canon/settings.canon.json"), {});
++  await writeSettings(join(hub, "upstreams/pi-skillful.json"), {});
++  await writeSettings(publicPath, {});
++  const publicSkill = { ...skill("public"), sourceInfo: { path: publicPath, source: hub, origin: "package", scope: "user" } };
++  const thirdParty = { ...skill("third-party"), sourceInfo: { path: publicPath, source: "npm:third-party", origin: "package", scope: "user" } };
++  const id = "hub:skills/public/SKILL.md";
++  await writeSettings(globalSettingsPath, { skillful: { hiddenSkills: ["third-party"], visibilityDefaults: { [id]: "hide" }, custom: 7 } });
++  const { handlers, registeredCommands } = registerVisibility([publicSkill, thirdParty].map(commandForSkill));
++  let menu;
++  const ctx = { cwd, mode: "tui", isProjectTrusted: () => true, ui: {
++    theme: identityTheme,
++    custom: async factory => { menu = factory({ requestRender() {} }, identityTheme, {}, () => {}); },
++    notify: message => assert.fail(message),
++  } };
++  await handlers.get("session_start")({ reason: "startup" }, ctx);
++  await registeredCommands.get("skillful").handler("", ctx);
++  assert.deepEqual(menu.skills.map(skill => skill.name), ["public"]);
++  menu.settingsList.onChange("public", "hide");
++  menu.handleInput("1");
++  await menu.saveQueue;
++  const path = join(cwd, ".pi/settings.json");
++  assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { skillful: { visibility: { [id]: "hide" } } });
++  menu.settingsList.onChange("public", "show");
++  await menu.saveQueue;
++  const event = { systemPromptOptions: { skills: [publicSkill, thirdParty, { ...publicSkill, name: "manual-only", disableModelInvocation: true }] } };
++  await handlers.get("before_agent_start")(event, ctx);
++  assert.deepEqual(event.systemPromptOptions.skills.map(skill => skill.disableModelInvocation), [undefined, undefined, true]);
++  menu.settingsList.onChange("public", "inherit");
++  await menu.saveQueue;
++  const hidden = { systemPromptOptions: { skills: [publicSkill, thirdParty] } };
++  await handlers.get("before_agent_start")(hidden, ctx);
++  assert.equal(hidden.systemPromptOptions.skills[0].disableModelInvocation, true);
++  assert.equal(hidden.systemPromptOptions.skills[1], thirdParty);
++  const prototype = { showLoadedResources() {
++    this.session.resourceLoader.getSkills();
++    this.loadedResourcesContainer.children.push({ getCollapsedText: () => "[Skills]", setText(text) { this.text = text; } });
++  } };
++  installStartupSkillListPatch(prototype);
++  const instance = Object.assign(Object.create(prototype), {
++    session: { resourceLoader: { getSkills: () => ({ skills: [publicSkill, thirdParty], diagnostics: [] }) } },
++    sessionManager: { getCwd: () => cwd }, loadedResourcesContainer: { children: [] },
++  });
++  ctx.ui.theme = { fg: (color, text) => `<${color}>${text}</${color}>` };
++  instance.showLoadedResources();
++  assert.ok(instance.loadedResourcesContainer.children[0].text.includes("<error>public</error>"));
++  assert.ok(instance.loadedResourcesContainer.children[0].text.includes("<dim>third-party</dim>"));
++});
++
++test("malformed settings preserve last good prompt visibility and reject menu saves visibly", async () => {
++  const cwd = await mkdtemp(join(home, "bad-settings-"));
++  const resource = skill("bad-settings");
++  const { handlers, registeredCommands } = registerVisibility([commandForSkill(resource)]);
++  await writeSettings(globalSettingsPath, { skillful: { hiddenSkills: [resource.name] } });
++  const errors = [];
++  const ctx = { cwd, mode: "tui", isProjectTrusted: () => false, ui: { theme: identityTheme, notify: message => errors.push(message) } };
++  await handlers.get("session_start")({ reason: "startup" }, ctx);
++  for (const raw of ["{broken", "[]", '{"skillful":{"visibility":[]}}', '{"skillful":{"hiddenSkills":"bad"}}']) {
++    await writeFile(globalSettingsPath, raw);
++    const event = { systemPromptOptions: { skills: [resource] } };
++    await handlers.get("before_agent_start")(event, ctx);
++    assert.equal(event.systemPromptOptions.skills[0].disableModelInvocation, true);
++    await registeredCommands.get("skillful").handler("", ctx);
++    assert.equal(await readFile(globalSettingsPath, "utf8"), raw);
++  }
++  assert.equal(errors.length, 4);
++});
++
+ test("startup patch retains support for the legacy resource component", async () => {
+   const cwd = await mkdtemp(join(home, "startup-colors-"));
+   await writeSettings(globalSettingsPath, { skillful: { hiddenSkills: ["hidden"] } });
+diff --git a/packages/pi-skillful/tests/visibility.test.mjs b/packages/pi-skillful/tests/visibility.test.mjs
+new file mode 100644
+index 0000000..ffb5869
+--- /dev/null
++++ b/packages/pi-skillful/tests/visibility.test.mjs
+@@ -0,0 +1,77 @@
++import assert from "node:assert/strict";
++import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import test from "node:test";
++import { readScopedSkillfulSettings } from "../.test-dist/src/config.js";
++import { publicSkillId, skillVisibilityId, skillIsHidden, scopedSkillChoice } from "../.test-dist/src/visibility.js";
++
++const root = realpathSync(mkdtempSync(join(tmpdir(), "skillful-identities-")));
++process.env.PI_CODING_AGENT_DIR = join(root, "agent");
++const cwd = join(root, "project");
++function write(path, value) { mkdirSync(join(path, ".."), { recursive: true }); writeFileSync(path, JSON.stringify(value)); }
++function skill(path, source = "auto", origin = "top-level") {
++  return { name: "same", sourceInfo: { path, source, origin, scope: "user" } };
++}
++function hub(path) {
++  write(join(root, "agent/machine.json"), { hubRepoPath: path });
++  write(join(path, "canon/settings.canon.json"), {});
++  write(join(path, "upstreams/pi-skillful.json"), {});
++  write(join(path, "skills/demo/SKILL.md"), {});
++  return skill(join(path, "skills/demo/SKILL.md"), path, "package");
++}
++
++test("public IDs require actual hub package provenance and real skills containment, including cache", () => {
++  const loaded = hub(join(root, "hub"));
++  assert.equal(publicSkillId(loaded, cwd), "hub:skills/demo/SKILL.md");
++  const impostor = hub(join(root, "impostor"));
++  write(join(root, "agent/machine.json"), { hubRepoPath: join(root, "hub") });
++  assert.equal(publicSkillId(impostor, cwd), undefined, "copied hub-shaped directories are not this repository");
++  assert.equal(publicSkillId({ ...loaded, sourceInfo: { ...loaded.sourceInfo, source: "npm:third-party" } }, cwd), undefined);
++  assert.equal(publicSkillId(skill(join(root, "hub/skills/demo/SKILL.md"), join(root, "third-party"), "package"), cwd), undefined);
++  write(join(root, "outside.md"), {});
++  symlinkSync(join(root, "outside.md"), join(root, "hub/skills/escape.md"));
++  assert.equal(publicSkillId(skill(join(root, "hub/skills/escape.md"), join(root, "hub"), "package"), cwd), undefined);
++  const cached = hub(join(root, "agent/git/github.com/nzh10/nzh10-skills"));
++  cached.sourceInfo.source = "git:github.com/nzh10/nzh10-skills@main";
++  assert.equal(publicSkillId(cached, cwd), "hub:skills/demo/SKILL.md");
++});
++
++test("private IDs separate same-name projects without absolute Project paths", () => {
++  const one = skill(join(cwd, ".pi/skills/same/SKILL.md"));
++  const two = skill(join(root, "second/.pi/skills/same/SKILL.md"));
++  assert.notEqual(skillVisibilityId(one, "global", cwd), skillVisibilityId(two, "global", cwd));
++  assert.equal(skillVisibilityId(one, "project", cwd), "project:.pi/skills/same/SKILL.md");
++  assert.equal(skillVisibilityId(two, "project", cwd), undefined);
++});
++
++test("per-item precedence, explicit equal choices, legacy empty override, inherit and visibleSkills", async () => {
++  const loaded = hub(join(root, "precedence-hub"));
++  const id = publicSkillId(loaded, cwd);
++  const privateSkill = skill(join(cwd, "private/SKILL.md"));
++  const projectId = skillVisibilityId(privateSkill, "project", cwd);
++  const globalId = skillVisibilityId(privateSkill, "global", cwd);
++  write(join(root, "agent/settings.json"), { skillful: { visibilityDefaults: { [id]: "hide" }, hiddenSkills: ["same"], visibility: { [globalId]: "hide" } } });
++  write(join(cwd, ".pi/settings.json"), { skillful: { hiddenSkills: [], visibility: { [projectId]: "inherit" } } });
++  let scoped = await readScopedSkillfulSettings(cwd, true);
++  assert.equal(skillIsHidden(loaded, cwd, scoped), true, "new public resources ignore legacy [] and names");
++  assert.equal(skillIsHidden(privateSkill, cwd, scoped), true, "per-item inherit bypasses legacy []");
++  delete scoped.project.visibility[projectId];
++  assert.equal(skillIsHidden(privateSkill, cwd, scoped), false, "untouched legacy Project [] preserves original replacement semantics");
++  scoped.project.visibility[id] = "show";
++  assert.equal(skillIsHidden(loaded, cwd, scoped), false);
++  scoped.project.visibility[id] = "inherit";
++  scoped.global.visibility[id] = "show";
++  assert.equal(skillIsHidden(loaded, cwd, scoped), false);
++  scoped.global.visibility[id] = "inherit";
++  assert.equal(skillIsHidden(loaded, cwd, scoped), true);
++  const thirdParty = { ...loaded, sourceInfo: { ...loaded.sourceInfo, source: "npm:third-party" } };
++  assert.equal(skillIsHidden(thirdParty, cwd, scoped), false);
++  scoped.project.visibleSkills = ["same"];
++  scoped.project.hiddenSkillsDefined = false;
++  assert.equal(scopedSkillChoice(privateSkill, "project", cwd, scoped), "inherit", "previously unused visibleSkills remains inert");
++  scoped = await readScopedSkillfulSettings(cwd, false);
++  assert.equal(skillIsHidden(privateSkill, cwd, scoped), true, "untrusted Project ignored");
++});
++
++test.after(() => { delete process.env.PI_CODING_AGENT_DIR; rmSync(root, { recursive: true, force: true }); });

@@ -21,4 +21,4 @@ jobs:
       - name: Run deterministic repository checks
         run: ./scripts/check-repo.sh
       - name: Run unit tests
-        run: node --test tests/guardrails.test.ts
+        run: node --test tests/*.test.*

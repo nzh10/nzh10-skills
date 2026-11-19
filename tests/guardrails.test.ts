@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+import { registerHooks } from "node:module";
 import { fileURLToPath } from "node:url";
 
 import registerPlainCheck, {
@@ -30,6 +31,23 @@ import registerPiSteward, {
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CANON_TOML = path.join(REPO_ROOT, "canon", "plain-check.toml");
+
+// Offline guardrail fixtures model the SDK callback contract; skillful-state tests
+// separately exercise the installed SDK lock and loader when PI_SDK_TEST_PATH is set.
+const sdkFixture = `import * as fs from 'node:fs'; import * as path from 'node:path';
+export const SettingsManager = { create(_cwd, agentDir) { return { storage: {
+  withLock(_scope, callback) {
+    const file = path.join(agentDir, 'settings.json');
+    const next = callback(fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : undefined);
+    if (next !== undefined) fs.writeFileSync(file, next);
+  }
+} }; } };`;
+registerHooks({ resolve(specifier, context, nextResolve) {
+  if (specifier === "@earendil-works/pi-coding-agent" && context.parentURL?.endsWith("/extensions/pi-steward.ts")) {
+    return { url: `data:text/javascript,${encodeURIComponent(sdkFixture)}`, shortCircuit: true };
+  }
+  return nextResolve(specifier, context);
+} });
 
 test("plain-check tail_regex intercepts closing menus, unrequested offers, and timid cleanup prompts", () => {
   const { config } = loadConfig(CANON_TOML);
@@ -390,6 +408,7 @@ test("pi-steward overwrites stale plain-check.toml from canon just like AGENTS.m
   const tmpAgent = fs.mkdtempSync(path.join(os.tmpdir(), "steward-test-"));
   try {
     fs.writeFileSync(path.join(tmpAgent, "plain-check.toml"), "enabled = true\nkeywords = []\n", "utf8");
+    fs.writeFileSync(path.join(tmpAgent, "settings.json"), "{}\n", "utf8");
     const diff = computeStewardDiff(REPO_ROOT, tmpAgent);
     const pcDiff = diff.fileChanges.find((f) => f.targetName === "plain-check.toml");
     assert.ok(pcDiff);
@@ -466,6 +485,7 @@ test("pi-steward serializes cache critical section and reports accurate /hub-sta
 
   const tmpAgent = fs.mkdtempSync(path.join(os.tmpdir(), "steward-status-"));
   try {
+    fs.writeFileSync(path.join(tmpAgent, "settings.json"), "{}\n", "utf8");
     const diff = computeStewardDiff(REPO_ROOT, tmpAgent);
     const laggingHubStatus = formatHubStatusText(diff, tmpAgent, {
       dirtyCount: 0,
@@ -1358,7 +1378,6 @@ test("pi-steward applyStewardDiff merges managed keys inside lock, aborts on ena
     assert.equal(fs.existsSync(statePath), false);
 
     // 3. Concurrent unmanaged key update (modelThinkingLevels/theme) inside lock is preserved
-    let savedJson = "";
     const preservingLock = {
       withLock(_scope: "global", fn: (current: string | undefined) => string | undefined) {
         const concurrentDisk = JSON.stringify({
@@ -1366,16 +1385,14 @@ test("pi-steward applyStewardDiff merges managed keys inside lock, aborts on ena
           theme: "dark-pro",
           enabledModels: [],
         });
-        const next = fn(concurrentDisk);
-        assert.ok(next !== undefined);
-        savedJson = next!;
-        fs.writeFileSync(settingsPath, next!, "utf8");
+        fs.writeFileSync(settingsPath, concurrentDisk, "utf8");
+        assert.equal(fn(concurrentDisk), undefined, "the locked atomic write must not trigger a second SDK write");
       },
     };
     const okRes = await applyStewardDiff(diff, fixture.agentDir, { settingsStorage: preservingLock });
     assert.equal(okRes.applied, true);
     assert.equal(okRes.settingsWritten, true);
-    const parsedSaved = JSON.parse(savedJson);
+    const parsedSaved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
     assert.deepEqual(parsedSaved.modelThinkingLevels, { "xai/grok-4.7": "high" });
     assert.equal(parsedSaved.theme, "dark-pro");
     assert.deepEqual(parsedSaved.enabledModels, ["xai/grok-4.7"]);

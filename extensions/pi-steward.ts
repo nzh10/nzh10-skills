@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR =
@@ -37,6 +37,7 @@ export interface MachineMarker {
   defaultModel?: string;
   lastSyncedCanonPackages?: string[];
   lastSyncedCanonModels?: string[];
+  skillful?: { enabled?: boolean };
 }
 
 export interface StewardSyncState {
@@ -46,7 +47,12 @@ export interface StewardSyncState {
   lastSyncedLocalHubPackage?: string;
   seenVisibleCanon?: string[];
   loginGuideShown?: boolean;
+  skillfulPackageId?: string;
+  pendingSettings?: { changes: PendingSettingChange[]; nextState: StewardSyncState };
 }
+
+type SettingValue = { present: false } | { present: true; value: unknown };
+type PendingSettingChange = { key: string; before: SettingValue; after: SettingValue };
 
 export type ProviderVisibility = "configured" | "unconfigured" | "unknown";
 
@@ -77,6 +83,7 @@ export interface SettingsStorageLike {
 
 export interface ApplyStewardDiffOptions {
   settingsStorage?: SettingsStorageLike;
+  recordLoginGuide?: boolean;
 }
 
 export interface ApplyStewardDiffResult {
@@ -84,6 +91,8 @@ export interface ApplyStewardDiffResult {
   settingsWritten: boolean;
   conflict?: boolean;
   lockError?: string;
+  actualDiff?: StewardDiff;
+  loginGuideProviders?: string[];
 }
 
 export type FileSyncPolicy = "overwrite" | "seed-if-missing" | "seed-if-empty";
@@ -100,6 +109,9 @@ export interface ManagedFileDiff {
 }
 
 export interface StewardDiff {
+  packageRepoRoot: string;
+  computeOptions?: ComputeStewardDiffOptions;
+  hasPendingSettings: boolean;
   mode: "writable-clone" | "read-only-sync";
   machineId: string | undefined;
   activeRepoRoot: string;
@@ -457,13 +469,21 @@ export function normalizePackageIdentity(entry: PackageSource, agentDir: string)
 }
 
 function atomicWriteFileSync(filePath: string, content: string): void {
-  const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+  const target = path.basename(filePath) === "settings.json" && fs.existsSync(filePath) ? fs.realpathSync(filePath) : filePath;
+  const dir = path.dirname(target);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = fs.mkdtempSync(path.join(dir, `.${path.basename(target)}-`));
+  const next = path.join(tmp, "next");
+  try {
+    const mode = path.basename(filePath) === SYNC_STATE_FILENAME ? 0o600
+      : fs.existsSync(target) ? fs.statSync(target).mode & 0o777 : 0o600;
+    const fd = fs.openSync(next, "wx", mode);
+    try { fs.writeFileSync(fd, content, "utf8"); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    fs.renameSync(next, target);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
-  const tmpPath = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
-  fs.writeFileSync(tmpPath, content, "utf8");
-  fs.renameSync(tmpPath, filePath);
 }
 
 export function readMachineMarker(agentDir: string): MachineMarker {
@@ -527,7 +547,7 @@ export function resolveActiveRepoRoot(
   };
 }
 
-const SPECIAL_SETTINGS_KEYS = new Set(["defaultProvider", "defaultModel", "enabledModels", "packages"]);
+const SPECIAL_SETTINGS_KEYS = new Set(["defaultProvider", "defaultModel", "enabledModels", "packages", "skillful"]);
 const MODEL_PROVIDER_GLOB_RE = /[*?[\]{}]/;
 
 export function extractExactModelProvider(entry: string): string | undefined {
@@ -775,24 +795,38 @@ export function computeStewardDiff(
   packageRepoRoot: string,
   agentDir: string,
   options?: ComputeStewardDiffOptions,
+  current?: { settings: CanonSettings; state?: StewardSyncState },
 ): StewardDiff {
-  const marker = readMachineMarker(agentDir);
-  const syncState = readSyncState(agentDir, marker);
+  const markerPath = path.join(agentDir, "machine.json");
+  const statePath = path.join(agentDir, SYNC_STATE_FILENAME);
+  const marker = readOptionalObject(markerPath) as MachineMarker | undefined ?? {};
+  if (marker.skillful !== undefined && (!isJsonObject(marker.skillful) ||
+    (marker.skillful.enabled !== undefined && typeof marker.skillful.enabled !== "boolean"))) {
+    throw new Error("Invalid machine.skillful.enabled");
+  }
+  const savedState = current ? current.state : readOptionalObject(statePath) as StewardSyncState | undefined;
+  const syncState: StewardSyncState = savedState ?? {
+    lastSyncedCanonPackages: marker.lastSyncedCanonPackages,
+    lastSyncedCanonModels: marker.lastSyncedCanonModels,
+  };
   const machineId = getSafeMachineId(marker.machineId);
   const { mode, activeRepoRoot, hubRepoPath } = resolveActiveRepoRoot(packageRepoRoot, marker, agentDir);
 
   const canonDir = path.join(activeRepoRoot, "canon");
   const canonSettingsPath = path.join(canonDir, "settings.canon.json");
   const localSettingsPath = path.join(agentDir, "settings.json");
-  const statePath = path.join(agentDir, SYNC_STATE_FILENAME);
 
   let settingsChanged = false;
   let enabledModelsChanged = false;
   let syncStateChanged = !fs.existsSync(statePath);
 
-  const localSettings: CanonSettings = fs.existsSync(localSettingsPath)
-    ? (JSON.parse(fs.readFileSync(localSettingsPath, "utf8")) as CanonSettings)
-    : {};
+  const existingSettings = current?.settings ?? readOptionalObject(localSettingsPath);
+  if (!existingSettings && savedState) throw new Error("settings.json is missing after takeover");
+  const localSettings: CanonSettings = existingSettings ?? {};
+  const localSkillful = settingsObject(localSettings.skillful, "settings.skillful");
+  if (!savedState && Object.hasOwn(localSkillful, "visibilityDefaults")) {
+    throw new Error("Local steward state is missing after Skillful takeover");
+  }
   const mergedSettings: CanonSettings = structuredClone(localSettings);
   const nextSyncState: StewardSyncState = structuredClone(syncState);
   const settingsPatch: SettingsManagedPatch = {
@@ -811,9 +845,8 @@ export function computeStewardDiff(
     options?.getProviderVisibility ?? createProviderVisibilityProbe(options?.modelRegistry);
   const shouldSyncModels = options?.syncModels ?? Boolean(visibilityProbe);
 
-  if (fs.existsSync(canonSettingsPath)) {
-    const canonSettings = JSON.parse(fs.readFileSync(canonSettingsPath, "utf8")) as CanonSettings;
-
+  const canonSettings = readOptionalObject(canonSettingsPath) as CanonSettings | undefined;
+  if (canonSettings) {
     const targetProvider = marker.defaultProvider ?? canonSettings.defaultProvider;
     const targetModel = marker.defaultModel ?? canonSettings.defaultModel;
     if (targetProvider !== undefined && mergedSettings.defaultProvider !== targetProvider) {
@@ -1018,6 +1051,56 @@ export function computeStewardDiff(
     }
   }
 
+  if (canonSettings) {
+    const managedPath = path.join(activeRepoRoot, "packages", "pi-skillful");
+    const managedId = normalizePackageIdentity(managedPath, agentDir);
+    const isSkillful = (pkg: PackageSource): boolean => {
+      const id = normalizePackageIdentity(pkg, agentDir);
+      return id === "npm:pi-skillful" || id === managedId || id === syncState.skillfulPackageId;
+    };
+    if (canonSettings.packages?.some(isSkillful)) throw new Error("Skillful is optional; remove its source from canon.packages");
+    const packages = mergedSettings.packages ?? [];
+    const selected = packages.find(isSkillful);
+    const enabled = marker.skillful?.enabled ?? selected !== undefined;
+    const nextPackages = packages.filter(pkg => !isSkillful(pkg));
+    if (enabled) {
+      const manifest = readOptionalObject(path.join(managedPath, "package.json"));
+      if (manifest?.name !== "pi-skillful" || !fs.existsSync(path.join(managedPath, "index.ts"))) {
+        throw new Error("Managed pi-skillful is missing or invalid; keeping the current source");
+      }
+      const source = shortenHome(managedPath);
+      const entry = typeof selected === "object" ? { ...selected, source } : source;
+      nextPackages.splice(selected === undefined ? nextPackages.length : packages.indexOf(selected), 0, entry);
+    }
+    if (!isDeepStrictEqual(packages, nextPackages)) {
+      mergedSettings.packages = nextPackages;
+      settingsPatch.setKeys.packages = nextPackages;
+      settingsChanged = true;
+    }
+    if (syncState.skillfulPackageId !== (enabled ? managedId : undefined)) {
+      if (enabled) nextSyncState.skillfulPackageId = managedId;
+      else delete nextSyncState.skillfulPackageId;
+      syncStateChanged = true;
+    }
+    incubatingPackages = incubatingPackages.filter(pkg => !isSkillful(pkg));
+
+    const shared = settingsObject(canonSettings.skillful, "canon.skillful");
+    const defaults = settingsObject(shared.visibility, "canon.skillful.visibility");
+    for (const [id, choice] of Object.entries(defaults)) {
+      if (!/^hub:skills\/(?:[a-zA-Z0-9_-][a-zA-Z0-9_.-]*\/)*[a-zA-Z0-9_-][a-zA-Z0-9_.-]*\.md$/.test(id) || (choice !== "show" && choice !== "hide")) {
+        throw new Error("Invalid public Skillful visibility default");
+      }
+    }
+    if (enabled || Object.hasOwn(localSkillful, "visibilityDefaults")) {
+      if (!isDeepStrictEqual(localSkillful.visibilityDefaults, defaults)) {
+        const nextSkillful = { ...localSkillful, visibilityDefaults: defaults };
+        mergedSettings.skillful = nextSkillful;
+        settingsPatch.setKeys.skillful = nextSkillful;
+        settingsChanged = true;
+      }
+    }
+  }
+
   const fileChanges: ManagedFileDiff[] = [];
   for (const rel of discoverCanonRelativeFiles(canonDir)) {
     const isCanonManaged = rel === "AGENTS.md" || rel === "plain-check.toml";
@@ -1049,6 +1132,9 @@ export function computeStewardDiff(
   const hasContentChanges = settingsChanged || fileChanges.some((f) => f.changed);
 
   return {
+    packageRepoRoot,
+    computeOptions: options,
+    hasPendingSettings: syncState.pendingSettings !== undefined,
     mode,
     machineId,
     activeRepoRoot,
@@ -1066,34 +1152,64 @@ export function computeStewardDiff(
   };
 }
 
-function mergeManagedSettingsContent(
-  currentRaw: string | undefined,
-  patch: SettingsManagedPatch,
-): { conflict: true } | { conflict: false; serialized: string } {
-  let base: CanonSettings = {};
-  if (currentRaw !== undefined && currentRaw.trim().length > 0) {
-    const parsed = JSON.parse(currentRaw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      throw new Error("settings.json root must be a JSON object");
-    }
-    base = parsed as CanonSettings;
-  }
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
 
-  if (patch.touchesEnabledModels) {
-    const currentModels = Array.isArray(base.enabledModels) ? base.enabledModels : undefined;
-    if (JSON.stringify(currentModels) !== JSON.stringify(patch.expectedLocalEnabledModels)) {
-      return { conflict: true };
-    }
-  }
+function settingsObject(value: unknown, label: string): Record<string, unknown> {
+  if (value === undefined) return {};
+  if (!isJsonObject(value)) throw new Error(`${label} must be a JSON object`);
+  return value;
+}
 
-  const nextObj: CanonSettings = structuredClone(base);
-  for (const key of patch.deleteKeys) {
-    delete nextObj[key];
+function parseObject(raw: string, label: string): Record<string, unknown> {
+  const value: unknown = JSON.parse(raw.replace(/^\uFEFF/, ""));
+  if (!isJsonObject(value)) throw new Error(`${label} must be a JSON object`);
+  return value;
+}
+
+function readOptionalObject(file: string): Record<string, unknown> | undefined {
+  try { return parseObject(fs.readFileSync(file, "utf8"), path.basename(file)); }
+  catch (err) { if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined; throw err; }
+}
+
+const SKILLFUL_DEFAULTS = "skillful.visibilityDefaults";
+
+function settingValue(settings: CanonSettings, key: string): SettingValue {
+  const record = key === SKILLFUL_DEFAULTS ? settingsObject(settings.skillful, "settings.skillful") : settings;
+  const property = key === SKILLFUL_DEFAULTS ? "visibilityDefaults" : key;
+  return Object.hasOwn(record, property) ? { present: true, value: record[property] } : { present: false };
+}
+
+function applySettingChanges(settings: CanonSettings, changes: PendingSettingChange[]): CanonSettings {
+  const result: CanonSettings = { ...settings };
+  for (const { key, after } of changes) {
+    const record = key === SKILLFUL_DEFAULTS ? { ...settingsObject(result.skillful, "settings.skillful") } : result;
+    const property = key === SKILLFUL_DEFAULTS ? "visibilityDefaults" : key;
+    if (after.present) Object.defineProperty(record, property, { value: after.value, writable: true, enumerable: true, configurable: true });
+    else delete record[property];
+    if (key === SKILLFUL_DEFAULTS) result.skillful = record;
   }
-  for (const [key, value] of Object.entries(patch.setKeys)) {
-    nextObj[key] = structuredClone(value);
-  }
-  return { conflict: false, serialized: JSON.stringify(nextObj, null, 2) + "\n" };
+  return result;
+}
+
+function pendingSettingChanges(before: CanonSettings, diff: StewardDiff): PendingSettingChange[] {
+  const keys = [...new Set([...diff.settingsPatch.deleteKeys, ...Object.keys(diff.settingsPatch.setKeys)])];
+  return keys.map(key => key === "skillful" ? SKILLFUL_DEFAULTS : key).map(key => ({
+    key, before: settingValue(before, key), after: settingValue(diff.mergedSettings, key),
+  })).filter(change => !isDeepStrictEqual(change.before, change.after));
+}
+
+function validSettingValue(value: unknown): value is SettingValue {
+  return isJsonObject(value) && (value.present === false || (value.present === true && Object.hasOwn(value, "value")));
+}
+
+function seedSettingsIfMissing(settingsPath: string): void {
+  // SDK storage locks after the callback when the settings file does not exist.
+  // Create only an empty file, exclusively; merge settings in the subsequent locked read.
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  try { fs.writeFileSync(settingsPath, "{}\n", { mode: 0o600, flag: "wx" }); }
+  catch (err) { if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err; }
 }
 
 export async function applyStewardDiff(
@@ -1101,74 +1217,90 @@ export async function applyStewardDiff(
   agentDir: string,
   options?: ApplyStewardDiffOptions,
 ): Promise<ApplyStewardDiffResult> {
-  let settingsWritten = false;
-  if (diff.settingsChanged) {
-    let storage = options?.settingsStorage;
-    if (!storage) {
-      const mod = (await import("@earendil-works/pi-coding-agent").catch(() => null)) as {
-        SettingsManager?: {
-          create?: (a: string, b: string) => { storage?: SettingsStorageLike };
-        };
-      } | null;
-      const sm = mod?.SettingsManager?.create?.(agentDir, agentDir);
-      if (typeof sm?.storage?.withLock === "function") {
-        storage = sm.storage;
-      }
-    }
-
-    let conflictDetected = false;
-    if (storage) {
-      try {
-        storage.withLock("global", (current) => {
-          const merged = mergeManagedSettingsContent(current, diff.settingsPatch);
-          if (merged.conflict) {
-            conflictDetected = true;
-            return undefined;
-          }
-          settingsWritten = true;
-          return merged.serialized;
-        });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return { applied: false, settingsWritten: false, lockError: msg };
-      }
-      if (conflictDetected) {
-        return { applied: false, settingsWritten: false, conflict: true };
-      }
-    } else {
-      const settingsPath = path.join(agentDir, "settings.json");
-      const currentRaw = fs.existsSync(settingsPath) ? fs.readFileSync(settingsPath, "utf8") : undefined;
-      const merged = mergeManagedSettingsContent(currentRaw, diff.settingsPatch);
-      if (merged.conflict) {
-        return { applied: false, settingsWritten: false, conflict: true };
-      }
-      atomicWriteFileSync(settingsPath, merged.serialized);
-      settingsWritten = true;
-    }
-  }
-
   const statePath = path.join(agentDir, SYNC_STATE_FILENAME);
-  const isInitialTakeover = !fs.existsSync(statePath);
+  const settingsPath = path.join(agentDir, "settings.json");
+  let settingsWritten = false;
+  let conflict = false;
+  let actualDiff: StewardDiff | undefined;
+  let loginGuideProviders: string[] | undefined;
+  const serialize = (value: unknown) => JSON.stringify(value, null, 2) + "\n";
+  try {
+    const storage = options?.settingsStorage ?? ((await import("@earendil-works/pi-coding-agent")).SettingsManager
+      .create(agentDir, agentDir) as unknown as { storage: SettingsStorageLike }).storage;
+    if (typeof storage?.withLock !== "function") throw new Error("Pi global settings lock is unavailable");
 
-  for (const file of diff.fileChanges) {
-    if (!file.changed || file.nextContent === undefined) continue;
-    if (file.backupOnInitialTakeover && isInitialTakeover && fs.existsSync(file.targetPath)) {
-      const bakPath = `${file.targetPath}.bak`;
-      if (!fs.existsSync(bakPath)) {
-        const existing = fs.readFileSync(file.targetPath, "utf8");
-        if (existing.trim().length > 0) {
-          atomicWriteFileSync(bakPath, existing);
-        }
-      }
+    if (!fs.existsSync(settingsPath)) {
+      if (fs.existsSync(statePath)) throw new Error("settings.json is missing after takeover");
+      seedSettingsIfMissing(settingsPath);
     }
-    atomicWriteFileSync(file.targetPath, file.nextContent);
-  }
+    storage.withLock("global", (current) => {
+      if (current === undefined) throw new Error("settings.json disappeared before locking");
+      let settings = parseObject(current, "settings.json") as CanonSettings;
+      let state = readOptionalObject(statePath) as StewardSyncState | undefined;
+      const initialTakeover = state === undefined;
+      if (state?.pendingSettings !== undefined) {
+        const pending = state.pendingSettings;
+        if (!isJsonObject(pending) || !Array.isArray(pending.changes) || !isJsonObject(pending.nextState) ||
+          pending.nextState.pendingSettings !== undefined || pending.changes.length === 0 ||
+          pending.changes.some(change => !isJsonObject(change) || typeof change.key !== "string" ||
+            !validSettingValue(change.before) || !validSettingValue(change.after))) {
+          throw new Error("Invalid pending settings transaction; preserving current files");
+        }
+        const matches = (phase: "before" | "after") => pending.changes.every(change =>
+          isDeepStrictEqual(settingValue(settings, change.key), change[phase]));
+        if (matches("before")) {
+          settings = applySettingChanges(settings, pending.changes);
+          atomicWriteFileSync(settingsPath, serialize(settings));
+          settingsWritten = true;
+        } else if (!matches("after")) {
+          conflict = true;
+          return undefined;
+        }
+        state = pending.nextState;
+        atomicWriteFileSync(statePath, serialize(state));
+      } else if (diff.settingsPatch.touchesEnabledModels && !isDeepStrictEqual(
+        Array.isArray(settings.enabledModels) ? settings.enabledModels : undefined,
+        diff.settingsPatch.expectedLocalEnabledModels,
+      )) {
+        conflict = true;
+        return undefined;
+      }
 
-  if (diff.syncStateChanged) {
-    atomicWriteFileSync(statePath, JSON.stringify(diff.nextSyncState, null, 2) + "\n");
-  }
+      // Re-plan from the locked snapshot; independent updates never reuse a stale settings patch.
+      actualDiff = computeStewardDiff(diff.packageRepoRoot, agentDir, diff.computeOptions, { settings, state });
+      const nextState = actualDiff.nextSyncState;
+      delete nextState.pendingSettings;
+      if (options?.recordLoginGuide && !nextState.loginGuideShown && actualDiff.missingAuthProviders.length > 0) {
+        nextState.loginGuideShown = true;
+        loginGuideProviders = actualDiff.missingAuthProviders;
+      }
+      for (const file of actualDiff.fileChanges) {
+        if (!file.changed || file.nextContent === undefined) continue;
+        if (file.backupOnInitialTakeover && initialTakeover && fs.existsSync(file.targetPath)) {
+          const bakPath = `${file.targetPath}.bak`;
+          const existing = fs.readFileSync(file.targetPath, "utf8");
+          if (!fs.existsSync(bakPath) && existing.trim().length > 0) atomicWriteFileSync(bakPath, existing);
+        }
+        atomicWriteFileSync(file.targetPath, file.nextContent);
+      }
 
-  return { applied: true, settingsWritten };
+      const changes = pendingSettingChanges(settings, actualDiff);
+      if (changes.length > 0) {
+        atomicWriteFileSync(statePath, serialize({ ...state, pendingSettings: { changes, nextState } }));
+        atomicWriteFileSync(settingsPath, serialize(applySettingChanges(settings, changes)));
+        settingsWritten = true;
+      }
+      if (changes.length > 0 || actualDiff.syncStateChanged || loginGuideProviders) {
+        atomicWriteFileSync(statePath, serialize(nextState));
+      }
+      return undefined; // We write atomically in the callback; the SDK must not write again.
+    });
+  } catch (err) {
+    return { applied: false, settingsWritten, lockError: err instanceof Error ? err.message : String(err) };
+  }
+  if (conflict) return { applied: false, settingsWritten, conflict: true };
+  if (!actualDiff) return { applied: false, settingsWritten, lockError: "Pi settings lock did not run the update" };
+  return { applied: true, settingsWritten, actualDiff, loginGuideProviders };
 }
 
 export function tokenizeShellClauses(command: string): string[][] {
@@ -1668,67 +1800,37 @@ export default function (pi: ExtensionAPI) {
         const prevLocalHubId = prevState.lastSyncedLocalHubPackage;
         const probe = createProviderVisibilityProbe(ctx.modelRegistry);
         const isTui = ctx.mode === "tui";
-        const diff = computeStewardDiff(packageRepoRoot, agentDir, {
+        const planned = computeStewardDiff(packageRepoRoot, agentDir, {
           syncModels: isTui && Boolean(probe),
           getProviderVisibility: probe,
         });
-        let notified = false;
-        if (diff.hasContentChanges || diff.syncStateChanged) {
-          const addedPkgs = diff.settingsChanged
-            ? findAddedPackageNames(
-                agentDir,
-                diff.mergedSettings.packages,
-                diff.nextSyncState.lastSyncedLocalHubPackage,
-                prevLocalHubId,
-              )
-            : [];
-          const applyRes = await applyStewardDiff(diff, agentDir);
-          if (!applyRes.applied) {
-            if (applyRes.lockError) {
-              notifyCtx(ctx, `pi-steward 写锁失败，已跳过本轮设置同步：${applyRes.lockError}`, "warning");
-            }
-            return false;
-          }
-          if (diff.hasContentChanges) {
-            const idLabel = diff.machineId ?? "read-only";
-            const pkgHint =
-              addedPkgs.length > 0
-                ? `（新增插件 ${addedPkgs.join(", ")} 将在下次启动或 /reload 时下载安装）`
-                : "";
-            const actionHint = diff.enabledModelsChanged
-              ? addedPkgs.length > 0
-                ? "执行 /reload 后再 /new（或重启 Pi）生效。"
-                : "执行 /new 或重启 Pi 使模型列表生效。"
-              : "执行 /reload 或重启 Pi 生效。";
-            notifyCtx(
-              ctx,
-              `pi-steward 已同步全局配置（${idLabel}）${pkgHint}，${actionHint}`,
-              "info",
-            );
-            notified = true;
-          }
+        const recordLoginGuide = isTui && ctx.hasUI && !prevState.loginGuideShown && planned.missingAuthProviders.length > 0;
+        if (!planned.hasContentChanges && !planned.syncStateChanged && !planned.hasPendingSettings && !recordLoginGuide) return false;
+        const result = await applyStewardDiff(planned, agentDir, { recordLoginGuide });
+        if (!result.applied || !result.actualDiff) {
+          const message = result.conflict
+            ? "检测到设置同时更改；保留现有设置，本轮同步停止。"
+            : result.settingsWritten ? "设置已落盘，待下次同步恢复状态。" : "本轮设置同步停止。";
+          notifyCtx(ctx, `pi-steward: ${message}${result.lockError ? ` ${result.lockError}` : ""}`, "warning");
+          return false;
         }
-
-        if (isTui && ctx.hasUI && diff.missingAuthProviders.length > 0) {
-          const latestState = readSyncState(agentDir);
-          if (!latestState.loginGuideShown) {
-            notifyCtx(
-              ctx,
-              `pi-steward: Canon 模型涉及尚未登录的厂商（${diff.missingAuthProviders.join(", ")}）；可按需执行 /login 补登，补登后执行 /reload 再 /new（或重启 Pi）生效，跳过即可，随时可用 /hub-status 复看。`,
-              "info",
-            );
-            const nextStateWithGuide: StewardSyncState = {
-              ...latestState,
-              loginGuideShown: true,
-            };
-            atomicWriteFileSync(
-              path.join(agentDir, SYNC_STATE_FILENAME),
-              JSON.stringify(nextStateWithGuide, null, 2) + "\n",
-            );
-          }
+        const diff = result.actualDiff;
+        const changed = diff.hasContentChanges || result.settingsWritten;
+        if (changed) {
+          const addedPkgs = diff.settingsChanged ? findAddedPackageNames(
+            agentDir, diff.mergedSettings.packages, diff.nextSyncState.lastSyncedLocalHubPackage, prevLocalHubId,
+          ) : [];
+          const idLabel = diff.machineId ?? "read-only";
+          const pkgHint = addedPkgs.length > 0 ? `（新增插件 ${addedPkgs.join(", ")} 将在下次启动或 /reload 时下载安装）` : "";
+          const actionHint = diff.enabledModelsChanged
+            ? addedPkgs.length > 0 ? "执行 /reload 后再 /new（或重启 Pi）生效。" : "执行 /new 或重启 Pi 使模型列表生效。"
+            : "执行 /reload 或重启 Pi 生效。";
+          notifyCtx(ctx, `pi-steward 已同步全局配置（${idLabel}）${pkgHint}，${actionHint}`, "info");
         }
-
-        return notified;
+        if (result.loginGuideProviders?.length) {
+          notifyCtx(ctx, `pi-steward: Canon 模型涉及尚未登录的厂商（${result.loginGuideProviders.join(", ")}）；可按需执行 /login 补登，补登后执行 /reload 再 /new（或重启 Pi）生效，跳过即可，随时可用 /hub-status 复看。`, "info");
+        }
+        return changed;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         notifyCtx(ctx, `pi-steward 同步告警：${msg}`, "warning");
@@ -1900,7 +2002,11 @@ export default function (pi: ExtensionAPI) {
         getProviderVisibility: probe,
       });
       const applyRes = await applyStewardDiff(diff, agentDir);
-      if (applyRes.applied && (markerWithLegacy.lastSyncedCanonPackages !== undefined || markerWithLegacy.lastSyncedCanonModels !== undefined)) {
+      if (!applyRes.applied) {
+        notifyCtx(ctx, `已保存机器身份，设置同步暂未完成：${applyRes.lockError ?? "检测到设置同时更改"}`, "warning");
+        return;
+      }
+      if (markerWithLegacy.lastSyncedCanonPackages !== undefined || markerWithLegacy.lastSyncedCanonModels !== undefined) {
         const cleanedMarker: MachineMarker = { ...markerWithLegacy };
         delete cleanedMarker.lastSyncedCanonPackages;
         if (Array.isArray(readSyncState(agentDir).seenVisibleCanon)) {

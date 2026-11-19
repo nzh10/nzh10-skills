@@ -1,0 +1,47 @@
+name: sync pi-skillful
+
+"on":
+  schedule:
+    - cron: "37 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-pi-skillful
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+      - name: Sync and apply maintained patch
+        run: ./scripts/sync-pi-skillful.sh
+      - name: Check before staging
+        env:
+          PI_TELEMETRY: "0"
+        run: |
+          ./scripts/check-repo.sh
+          node --test tests/*.test.*
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config core.hooksPath .githooks
+          git config branch.master.rebase true
+          mkdir -p "$(git rev-parse --git-path info)"
+          printf '%s\n' "$HOME" "$(hostname)" > "$(git rev-parse --git-path info/no-upload-personal)"
+          git add -- packages/pi-skillful upstreams/pi-skillful.json
+          if git diff --cached --quiet; then
+            echo "pi-skillful already matches upstream"
+            exit 0
+          fi
+          sha=$(node -p 'JSON.parse(require("fs").readFileSync("upstreams/pi-skillful.json", "utf8")).sha')
+          git commit -m "chore: sync pi-skillful from jvm/pi-mono@${sha}"
+          ./.githooks/no-personal-info --portable HEAD
+          git push

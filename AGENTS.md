@@ -5,8 +5,9 @@
 ## Directory and File Boundaries
 
 - Edit `canon/settings.canon.json`, `canon/AGENTS.md`, and `canon/plain-check.toml` for cross-machine defaults. On writable clones (`machine.json` with `hubRepoPath`), `pi-steward` maps the `nzh10-skills` package in `~/.pi/agent/settings.json` directly to `hubRepoPath` and reconciles `canon/AGENTS.md` and `canon/plain-check.toml` to `~/.pi/agent/` on startup and `/reload`; update the matching `~/.pi/agent/` copy immediately when the active session needs a config change before reload.
-- Keep `pools/<machineId>/incubating.json` limited to cross-machine `npm:` and `git:` package sources. Keep `pools/<machineId>/machine-env.md` free of usernames, hostnames, home paths, and private network addresses.
+- Keep pool package sources portable (`npm:` or `git:`). Collect only explicitly selected public Skillful visibility settings through `skills/pi-steward/SKILL.md`. Keep all pool records free of usernames, hostnames, home paths, and private network addresses.
 - Treat `skills/skill-creator/`, `patches/skill-creator.patch`, `scripts/sync-skill-creator.sh`, `upstream.json`, and `.github/workflows/sync-skill-creator.yml` as upstream-managed paths. Edit them only when the user explicitly requests changes to `skill-creator` sync, and keep `patches/skill-creator.patch` limited to `claude`-to-`pi` adaptations and verified script fixes.
+- Maintain optional `packages/pi-skillful/` through `scripts/sync-pi-skillful.sh` and `patches/pi-skillful.patch`; the source revision is in `upstreams/pi-skillful.json`. Apply the patch before replacing the copy. Keep this optional package out of `canon.packages` and edit neither the installed npm package nor the cache.
 - Read `skills/pi-steward/SKILL.md` completely before you promote, remove, or pool packages, models, or machine configs.
 
 ## Privacy and Hook Redlines
@@ -18,7 +19,7 @@
 ## Git Commit and Release Rules
 
 - Use the existing pre-commit hook to catch invalid submitted files before they enter history. It checks index content for privacy, Pi settings structure, extension default registration functions, plain-check rules, and Node JS/TS syntax. TypeScript is stripped with Node's built-in parser before JavaScript syntax checking; staged extension inputs use a small temporary directory for the existing import checks.
-- Run `scripts/check-repo.sh` and `node --test tests/guardrails.test.ts` before committing changes to extensions, canon rules, or hooks.
+- Run `scripts/check-repo.sh` and `node --test tests/*.test.*` before committing changes to extensions, managed packages, canon rules, or hooks.
 - Stage explicit file paths (`git add -- <paths>`) and review `git diff --cached` before each commit.
 - Use unscoped Conventional Commit subjects (`feat: ...`, `fix: ...`, `chore: ...`) in imperative mood.
 - Group each logical change into one self-contained commit so related edits land together without fixup churn. Direct commits on `master` are supported; use a local branch optionally for multi-day experiments, and run `git pull --rebase` when `origin/master` has new commits before pushing.
