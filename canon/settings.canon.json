@@ -19,6 +19,7 @@
     "npm:pi-antigravity-acp-provider",
     "npm:pi-subagents",
     "npm:pi-intercom",
-    "npm:pi-btw"
+    "npm:pi-btw",
+    "npm:pi-autoresearch"
   ]
 }
