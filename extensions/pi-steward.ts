@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, promisify } from "node:util";
 
@@ -1528,6 +1529,22 @@ export function runInCacheCriticalSection<T>(fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
+const CACHE_FETCH_TIMEOUT_MS = 8000;
+const CACHE_FETCH_RETRY_DELAY_MS = 750;
+
+function describeGitFailure(error: unknown, timeoutMs?: number): { message: string; retryable: boolean } {
+  const failure = error as (Error & { stderr?: unknown; killed?: boolean; signal?: string }) | undefined;
+  const stderr = typeof failure?.stderr === "string" ? failure.stderr.trim() : "";
+  const timedOut = timeoutMs !== undefined && failure?.killed === true && failure.signal === "SIGTERM";
+  const detail = stderr || (failure?.message ?? String(error));
+  const safeDetail = detail.replace(/(\bhttps?:\/\/)[^/\s@]+@/gi, "$1[redacted]@").replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").slice(0, 600);
+  const message = timedOut
+    ? `Git fetch timed out after ${timeoutMs / 1000}s${stderr ? `: ${safeDetail}` : ""}`
+    : safeDetail;
+  const retryable = timedOut || /SSL_ERROR_SYSCALL|SSL_ERROR_ZERO_RETURN|unexpected eof|connection (?:reset|closed|timed out)|operation timed out|early EOF|failed to connect|could not resolve host|remote end hung up|requested URL returned error: (?:502|503|504)\b/i.test(stderr);
+  return { message, retryable };
+}
+
 export async function syncCacheRepoToUpstream(
   cacheRepoPath: string,
   agentDir: string,
@@ -1545,18 +1562,28 @@ export async function syncCacheRepoToUpstream(
     GIT_TERMINAL_PROMPT: "0",
     GCM_INTERACTIVE: "never",
   };
-  try {
-    await execFileAsync(gitBin, ["-C", cacheRepoPath, "fetch", "--quiet", "--prune", "origin"], {
-      timeout: 8000,
-      signal,
-      env: gitEnv,
-    });
-  } catch (err) {
-    if (signal?.aborted) {
-      return { ok: true, changed: false };
+  for (let attempt = 1; ; attempt++) {
+    if (signal?.aborted) return { ok: true, changed: false };
+    try {
+      await execFileAsync(gitBin, ["-C", cacheRepoPath, "fetch", "--quiet", "--prune", "origin"], {
+        timeout: CACHE_FETCH_TIMEOUT_MS,
+        signal,
+        env: gitEnv,
+      });
+      break;
+    } catch (err) {
+      if (signal?.aborted) return { ok: true, changed: false };
+      const { message, retryable } = describeGitFailure(err, CACHE_FETCH_TIMEOUT_MS);
+      if (!retryable || attempt === 2) {
+        return { ok: false, changed: false, error: attempt === 2 ? `${message} (after 2 attempts)` : message };
+      }
+      try {
+        await delay(CACHE_FETCH_RETRY_DELAY_MS, undefined, { signal });
+      } catch (err) {
+        if (signal?.aborted) return { ok: true, changed: false };
+        throw err;
+      }
     }
-    const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
-    return { ok: false, changed: false, error: msg };
   }
   if (signal?.aborted) {
     return { ok: true, changed: false };
@@ -1583,8 +1610,7 @@ export async function syncCacheRepoToUpstream(
         shortSha: targetSha.slice(0, 7),
       };
     } catch (err) {
-      const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
-      return { ok: false, changed: false, error: msg };
+      return { ok: false, changed: false, error: describeGitFailure(err).message };
     }
   });
 }

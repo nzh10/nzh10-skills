@@ -10,7 +10,7 @@ description: 管理 nzh10-skills 仓库中跨机器的 Pi 宿主全局配置（c
 ## 四条不可逾越的红线
 
 1. **未经明确指示绝不自动 Promote 或 Push**：仅当用户明确要求「存进沉淀池」或「promote / 转正到全局」时才写入仓库或推送。
-2. **只读同步节点严禁手改包缓存**：若 `<agentDir>/machine.json` 无有效 `hubRepoPath`，当前机器即为只读同步节点（由 `pi-steward` 在交互式启动与 `/reload` 时自动拉取并硬重置 `<agentDir>/git/github.com/nzh10/nzh10-skills` 包缓存至远端，严禁人工在包缓存内编辑或提交）；需改全局配置时，直接用一句话说明当前为只读同步节点，引导在主力开发机操作或先克隆仓库运行 `/hub-init <machineId> <hubRepoPath>`。
+2. **只读同步节点严禁手改包缓存**：若 `<agentDir>/machine.json` 无有效 `hubRepoPath`，当前机器即为只读同步节点（由 `pi-steward` 在交互式启动与 `/reload` 时自动拉取并硬重置 `<agentDir>/git/github.com/nzh10/nzh10-skills` 包缓存至远端，严禁人工在包缓存内编辑或提交）；遇到连接中断等可重试错误时会再拉一次；仍失败就保留当前版本并显示 Git 的具体错误。需改全局配置时，直接用一句话说明当前为只读同步节点，引导在主力开发机操作或先克隆仓库运行 `/hub-init <machineId> <hubRepoPath>`。
 3. **严禁绕过隐私与密钥钩子（绝不使用 `--no-verify`）**：公开仓库依靠 `.githooks/pre-commit` 与 `.githooks/pre-push` 结合本地 `.git/info/no-upload-personal` 拦截本机用户名、主机名、家目录路径与密钥。任何时候严禁传 `--no-verify`；钩子拦截时立即停止并如实报告命中项。
 4. **保护云端自动同步路径（Read-Only Paths）**：除非用户点名要求，**绝不修改 `skills/skill-creator/`、`patches/skill-creator.patch`、`scripts/sync-skill-creator.sh`、`upstream.json` 或 `.github/workflows/sync-skill-creator.yml`**。
 
