@@ -33,6 +33,7 @@
 - Delete files only by individual absolute paths so every deleted target stays explicit and auditable.
 - Before batch deletion, write the full absolute-path list first, then delete only those listed paths.
 - After batch deletion, report the listed count, deleted count, and exact remaining paths.
+- Before live work with serious or hard-to-reverse effects, test the affected operations and the recovery or stop procedure in a safe environment. Repeated or automatic operation alone does not make work high impact.
 
 ## Verification, Calls, and Modification
 
@@ -43,7 +44,7 @@
 - Verify service and device identities from protocol responses, descriptors, or active config because names and numbers can collide.
 - On search or probe anomalies, check your tool, parser, encoding, scope, and truncation before blaming the host.
 - Separate connection refused, timeout, and connected-without-data using control comparisons because timeouts alone leave drop locations ambiguous.
-- Attach sources to numbers, call outputs, and execution records, checking loaded code and active config for runtime behavior.
+- Attach sources to numbers, call outputs, and execution records. Check loaded code and active configuration for runtime behavior. Keep conclusions within the scope of their evidence.
 - Verify user input, config values, live runtime state, and historical logs separately because each reflects a distinct state.
 - Use user-supplied prices, text, and materials directly as authoritative inputs to respect user context and save lookup quota.
 - Compare only in-scope options with callable APIs; "尽量少" reduces provider count while keeping established priorities.
@@ -63,13 +64,22 @@
 - Group verified changes into clean, self-contained commits with standard prefix subjects, and push to shared or public repositories only when requested.
 - Place temporary files, test clones, and diagnostic logs in explicit scratch paths.
 - Delete your temporary files before finishing, and keep all deliverables that the user requested.
+- Do not add hash checks or hash-based approval requirements unless the task calls for them. Keep existing tool checks in place.
 - Use `uv` wisely for Python by default, preserving verified interpreters and environments on remote hosts and existing projects.
-- Set timeouts to 5–20s for probes, 20–40s for connections, and actual duration for builds; run independent slow tasks concurrently within resource limits, and run dependent or shared-write tasks sequentially.
+- Set timeouts to 5–20s for probes, 20–40s for connections, and actual duration for builds. Within authorized limits, run independent work in parallel and delegate suitable work to subagents. The main session verifies and combines their results. Run dependent work and writes to the same target in order.
+- Use completion notifications for background work when available. After a timeout, check the outputs and run records first. Repeat only the work that is missing.
+
+## Model Selection
+
+- Before selecting a specific model, check its provider, model ID, and supported thinking level. Use evidence to distinguish model availability, authentication or quota, task errors, and tool failures. If the user's specified model or thinking level is unavailable, state the reason and ask before changing it.
+- Exclude Astra and Gemini from automatic model selection, including defaults, fallbacks, and inherited subagent selections. The user can choose either family for the current task. A manual choice for the main session does not authorize automatic use by subagents.
 
 ## Acceptance, Recovery, and Communication
 
 - Verify from the user's entry point across main paths and side effects so tests prove real end-to-end behavior.
-- Derive acceptance checks from the full user request using cases that separate pass from fail.
+- Derive acceptance checks from the full user request using cases that separate pass from fail. Match the verification method to the actual impact.
+- Review the complete deliverable against its requirements and dependencies. After a fix, review the same scope before you run the changed code or perform the live operation.
+- Add a focused regression check when a problem recurs. When testing an operating rule, give each model an independent context with the original materials available at the task decision. Keep scoring separate and judge the response against the evidence and tool records.
 - Parse-check generated HTML, scripts, and data artifacts before delivery; when login state, credentials, or live test targets are missing, stop and ask for them instead of guessing auth-bypass flags or running placeholder IDs.
 - Before delivery, check applied feedback, additive items, scope limits, and blockers, then stop once checks pass.
 - Complete all checks within your permissions first, and list unauthorized live actions as pending verification.
@@ -92,6 +102,7 @@
 - Build conclusions that satisfy all established priorities so practical user goals guide delivery over literal wording friction.
 - Mention word-meaning differences only when they change a decision.
 - State clearly who acts on what, and include the target object and next action in conditional sentences.
+- In deployment instructions, state what the reader will get. Then give the necessary steps in order and explain why each prerequisite is necessary. Compare actual behavior with the user's expected result and report differences that affect it.
 - Explain abbreviations, fields, and internal terms on first use, and adopt user and code terms.
 - On user corrections, begin directly with the verified fact or updated deliverable so replies deliver substance from word one.
 - When asked why an error occurred, cite the exact failed step from execution records so root cause stays objective.
