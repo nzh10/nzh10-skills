@@ -371,7 +371,8 @@ test("plain-check runtime bypasses only PI_SUBAGENT_CHILD, preserves headless fe
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
     if (prevSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
     else process.env.PI_SUBAGENT_CHILD = prevSubagentChild;
-    fs.rmSync(tmpAgent, { recursive: true, force: true });
+    // An in-flight audit append may create the log during recursive cleanup.
+    fs.rmSync(tmpAgent, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
   }
 });
 
